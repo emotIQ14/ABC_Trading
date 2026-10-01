@@ -281,6 +281,8 @@ class MarketMakerEngine:
     def on_settlement(self, s: Settlement) -> PnLBreakdown
     def marks(self) -> dict[str, float]                         # last p_up per market (for equity)
     def equity(self) -> float
+    def last_fair(self, market_id: str) -> FairValue | None     # read-only, for reporting
+    def phase_of(self, market_id: str) -> Phase | None          # read-only, for reporting
 ```
 The exact helper signatures in 4.3 may be refined by the implementer; the **engine API** and
 `compute_quotes`/`phase_for`/`RiskManager` shown are fixed. Document any deviation in the
