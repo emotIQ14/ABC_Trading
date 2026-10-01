@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# run artefacts and anything that could hold secrets
+runs/
+data_cache/
+*.jsonl
+!tests/fixtures/*.jsonl
+.env
+.env.*
+*.pem
+*.key
+secrets.*
