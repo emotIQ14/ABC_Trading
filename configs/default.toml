@@ -1,0 +1,99 @@
+# ABC_Trading default configuration: every key with its default value.
+#
+# Loading this file gives exactly BotConfig() (tests/test_config.py enforces it).
+# All values are illustrative starting points, NOT calibrated against real Polymarket data.
+# Fee parameters in particular must be checked against Polymarket's published fee schedule
+# before any PnL number is trusted. Prices are USDC per share in [0, 1]; sizes are shares.
+#
+# `sizing.clip_equity_fraction` defaults to None, which TOML cannot represent, so the key is
+# omitted below. Set it to a number in (0, 1] to size clips as equity * fraction / price.
+
+[fees]
+# taker fee = size * price * taker_fee_rate * (price * (1 - price)) ** taker_fee_exponent
+maker_fee_rate = 0.0        # fraction of notional charged to makers
+maker_rebate_rate = 0.0     # fraction of notional paid back to makers
+taker_fee_rate = 0.25       # placeholder shaped like the short-dated crypto market fee curve
+taker_fee_exponent = 2.0    # curve steepness; larger = fee concentrated near 50c
+
+[sizing]
+clip_shares = 100.0         # base size per ladder level (~$50 at 50c)
+# clip_equity_fraction omitted: None means a fixed clip_shares
+min_clip_shares = 5.0       # lower bound when sizing from equity
+max_clip_shares = 1000.0    # upper bound when sizing from equity
+ladder_levels = 3           # resting bids per token
+ladder_spacing_ticks = 1    # ticks between ladder levels
+ladder_size_decay = 0.7     # size multiplier per deeper ladder level
+requote_tolerance_ticks = 0 # keep a resting order if its price is within this many ticks
+
+[pair]
+target_margin = 0.01        # want avg_up_cost + avg_down_cost <= 1 - target_margin
+taker_lock_margin = 0.005   # min NET margin to complete a pair by crossing the spread
+rebalance_max_loss_per_pair = 0.0   # extra loss tolerated when completing a pair
+max_net_imbalance_shares = 300.0    # |UP - DOWN| cap in hedged-neutral mode
+max_inventory_per_side_shares = 1500.0  # cap on shares held per token
+skew_ticks_per_100_shares = 1.0     # bid skew against the heavy side
+rebalance_trigger_shares = 100.0    # unpaired quantity that triggers taker completion
+merge_enabled = true        # merge UP+DOWN pairs back into USDC
+merge_min_pairs = 50.0      # batch merges (on-chain in live trading)
+
+[directional]
+enabled = true              # keep part of the exposure directional when the model sees edge
+min_edge = 0.03             # model prob minus price paid needed to add/hold directional shares
+max_directional_shares = 200.0      # max deliberate |UP - DOWN| per market
+kelly_fraction = 0.25       # fraction of full Kelly used to size the directional target
+hold_margin = 0.02          # at FLATTEN: hold unpaired shares iff p_model - exit_price >= this
+
+[timing]
+warmup_seconds = 15.0       # after window start before quoting
+wind_down_seconds = 90.0    # before end: stop adding to the heavy side
+flatten_seconds = 25.0      # before end: cancel quotes, merge, resolve the remainder
+min_requote_interval_seconds = 1.0  # do not re-quote a market more often than this
+
+[model]
+vol_halflife_seconds = 300.0        # EWMA half-life for realised vol
+vol_floor = 2e-5            # floor on per-sqrt(second) log-return vol
+momentum_lookback_seconds = 30.0    # spot lookback for the momentum feature
+accel_lookback_seconds = 10.0       # shorter lookback for the acceleration feature
+w_momentum = 0.15           # weights on the normalised features added to z (uncalibrated)
+w_accel = 0.05              # weight on acceleration (uncalibrated)
+w_book_imbalance = 0.10     # weight on order-book depth imbalance (uncalibrated)
+shrink_to_market = 0.5      # 0 = pure model, 1 = pure market mid
+p_floor = 0.02              # model probability clipped to [p_floor, 1 - p_floor]
+min_tau_seconds = 1.0       # floor on time-to-end used in the z-score
+
+[risk]
+max_capital_per_market_usd = 1500.0 # cost basis + resting bids per market
+max_total_capital_usd = 5000.0      # same, across all markets
+max_daily_loss_usd = 1000.0         # kill switch (realised + mark-to-model)
+max_spot_staleness_seconds = 5.0    # no quotes when spot is older than this
+max_orders_per_second = 20.0        # order-rate limiter (cancels count)
+max_spread_ticks_to_quote = 6       # do not quote dislocated/wide books
+
+[exchange]
+# paper exchange only: there is no live trading in this project
+initial_cash = 10000.0      # starting USDC
+latency_ticks = 1           # snapshots before a new order can fill
+queue_ahead_fraction = 1.0  # share of displayed size at our price assumed ahead of us
+trade_fill_fraction = 1.0   # share of a print assumed available to us after the queue
+taker_slippage_ticks = 0    # extra adverse ticks charged on IOC fills
+enforce_min_order_size = true       # reject orders below the market's minimum size
+
+[sim]
+# synthetic market generator: results on it validate MECHANICS, never profitability
+seed = 1                    # RNG seed; same seed + config = identical feed
+assets = ["BTC", "ETH"]     # underlyings to simulate
+window_seconds = 900        # market window length (15 minutes)
+n_windows = 8               # back-to-back windows per asset
+tick_seconds = 1.0          # seconds between snapshots
+spot0 = { BTC = 60000.0, ETH = 3000.0 }     # starting spot per asset
+annual_vol = { BTC = 0.55, ETH = 0.75 }     # true annualised vol per asset
+market_vol_multiplier = 1.0 # market's implied vol / true vol
+market_lag_seconds = 2.0    # market prices off spot this many seconds stale
+pricing_noise_ticks = 0.7   # AR(1) noise on the market's UP mid, in ticks
+tick_size = 0.01            # price increment
+min_order_size = 5.0        # minimum order size in shares
+mean_spread_ticks = 1.5     # average bid-ask spread in ticks
+depth_mean_shares = 400.0   # average displayed size per level
+n_levels = 5                # book levels per side
+uninformed_trades_per_sec = 0.3     # random touch trades per sec per token side
+informed_flow = 1.0         # 0 = no sweeps on price moves, i.e. no adverse selection
