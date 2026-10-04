@@ -141,7 +141,7 @@ class SimConfig:
     mean_spread_ticks: float = 1.5
     depth_mean_shares: float = 400.0
     n_levels: int = 5
-    uninformed_trades_per_sec: float = 0.3  # random touch trades per sec per token side
+    uninformed_trades_per_sec: float = 0.3  # random touch trades per sec per market (on both books)
     informed_flow: float = 1.0  # 0 = no sweeps on price moves, i.e. no adverse selection
 
 

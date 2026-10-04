@@ -9,28 +9,40 @@
 
 This file records what the integration pass observed when the finished modules were run end to end
 (`SyntheticFeed` -> `MarketMakerEngine` -> `PaperExchange` -> `run_backtest`), which anomalies were
-looked for, and what caused each one. All numbers below were produced by the commands in section 9
-and are exactly as observed (nothing was tuned, rounded in the strategy's favour or re-run to get a
-better number). Every run is deterministic, so any row can be reproduced exactly (the wall-time
-column of section 5 aside).
+looked for, and what caused each one. Nothing was tuned, rounded in the strategy's favour or re-run
+to get a better number. Every run is deterministic, so any row can be reproduced exactly (the
+wall-time columns of section 5 aside).
 
-A later review found that the first version of the paper exchange applied the order latency to
-new orders but let a cancel take effect at once, which flattered fills and PnL. A cancel now takes
-the same latency as an order (section 6.12). Every table and figure below was regenerated with
-that model; section 6.12 keeps the instant-cancel figures they replace, so the size of the effect
-can be seen, and says which statements of the first version no longer hold.
+**Provenance.** The tables of sections 2 to 5, and every figure below that is not marked with a
+dagger (†), come from the commands of section 9 (`--out DIR` writes the files they were read from)
+and were copied from `result.json`, `markets.csv` and `fills.csv` by a script, so that no number
+was typed by hand. That script is not part of the repository. Figures marked † come from scratch
+analysis scripts that are not in the repository either: a subclass of the exchange that records the
+life of every order, an independent recomputation of cash from the fills, the random-configuration
+and corrupted-feed sweeps, the counterfactual exchanges of 6.12 and 6.13, and the timing scripts of
+section 5. They can be re-derived from the code and the commands of section 9, but not by running a
+command that ships with the repository. Section 9 says which is which.
+
+This file has been regenerated after each review that changed the code, and everything in it
+describes the code of section 1. A later review found that the first version of the paper exchange
+applied the order latency to new orders but let a cancel take effect at once, which flattered fills
+and PnL. A cancel now takes the same latency as an order (section 6.12). Section 6.12 keeps the
+instant-cancel figures that the cancel latency replaced, so the size of the effect can be seen, and
+says which statements of the first version no longer hold. The review fixes recorded in 6.13 to
+6.15 (shared IOC depth, the report, a scarce cash budget) and the engine's reservation of a maker
+fee (6.8) came after it, and the tables below were regenerated once more after the last of them.
 
 ## 1. What was run
 
 | Item | Value |
 |---|---|
-| Code | `HEAD` 0a97c6e plus the uncommitted working tree holding all modules (the lead commits) |
+| Code | `HEAD` 5bd469a, which is `d6b60fa` (the first full implementation) plus the fixes of the adversarial review: cancel latency (6.12), shared IOC depth (6.13), the report and CLI changes (6.14), the priority of a scarce cash budget (6.15), the engine's reservation of a maker fee (6.8), the settled-market index of `Portfolio` (section 5), and stricter validation of configs and of the data clients. The documentation refresh that regenerated this file changed only documentation and comment lines (`config.py`, `configs/default.toml`); no code logic changed after the runs were made, and a re-run of default seed 1 is byte-identical to the stored one |
 | Interpreter / machine | Python 3.11.15, Linux x86_64, 4-core Intel Xeon 2.1 GHz |
 | Config | built-in `BotConfig()` defaults (identical to `configs/default.toml`, tested) unless a row says otherwise |
 | Simulation | 12 windows of 900 s per asset, BTC and ETH (24 markets, 21,600 snapshots, 21,624 events) unless a row says otherwise |
 | Account | 10,000 USDC initial cash, `latency_ticks=1`, `queue_ahead_fraction=1.0`, `trade_fill_fraction=1.0` |
-| Checks | invariants 1-4 of DESIGN section 7 checked after every event in every run (never violated) |
-| Test suite | 2,007 tests pass (about 30 s), `ruff check`, `ruff format --check` and `mypy src` clean |
+| Checks | invariants 1-4 of DESIGN section 7 checked after every event in every run, except the scaling runs of section 5 that say `--no-invariants` (never violated) |
+| Test suite | 2,076 tests pass (about 35 s), `ruff check`, `ruff format --check` and `mypy src` clean |
 
 Column definitions used in every table:
 
@@ -39,8 +51,8 @@ Column definitions used in every table:
   about 53 USDC; nothing here is tuned to it).
 * **Pair completion** is `2 * (pairs merged + pairs held at close) / shares bought`.
 * **Max drawdown** is measured on the mark-to-mid equity curve sampled every 60 events (30 simulated
-  seconds with two assets). Event-granular drawdown is larger (one 4-window check: 227.7 against
-  204.2 sampled).
+  seconds with two assets). Event-granular drawdown is larger: `--sample-every 1` on default seed 1
+  gives 469.5 against 431.5 sampled.
 * **Brier model / market** is the Brier score at the last ACCUMULATE snapshot of each market of the
   engine's `p_up` (the model shrunk 50% toward the market) and of the market's own UP mid, against
   the realised winner. Lower is better; always saying 0.5 scores 0.25. With 24 markets per run these
@@ -51,49 +63,52 @@ Column definitions used in every table:
 
 | Seed | Windows | Assets | Fills | Avg trade (USDC) | Pair completion | PnL (USDC) | Max drawdown (USDC) | Brier model | Brier market | Kill switch |
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| 1 | 12 x 900 s | BTC,ETH | 1255 | 36.01 | 95.7% | +338.98 | 440.6 | 0.1211 | 0.1111 | no |
+| 1 | 12 x 900 s | BTC,ETH | 1260 | 35.91 | 95.7% | +359.90 | 431.5 | 0.1211 | 0.1111 | no |
 | 2 | 12 x 900 s | BTC,ETH | 665 | 35.30 | 90.7% | -744.96 | 1070.6 | 0.0931 | 0.0949 | TRIPPED |
-| 3 | 12 x 900 s | BTC,ETH | 965 | 33.96 | 93.8% | -242.88 | 551.9 | 0.1043 | 0.1005 | no |
-| 4 | 12 x 900 s | BTC,ETH | 942 | 34.68 | 93.7% | -499.95 | 753.7 | 0.0739 | 0.0706 | no |
+| 3 | 12 x 900 s | BTC,ETH | 980 | 33.92 | 93.8% | -335.42 | 551.9 | 0.1043 | 0.1005 | no |
+| 4 | 12 x 900 s | BTC,ETH | 947 | 34.63 | 93.6% | -472.82 | 726.6 | 0.0739 | 0.0706 | no |
 | 5 | 12 x 900 s | BTC,ETH | 821 | 34.54 | 91.9% | -726.44 | 969.9 | 0.0131 | 0.0118 | no |
 | 6 | 12 x 900 s | BTC,ETH | 807 | 35.69 | 91.7% | -894.99 | 1034.5 | 0.0209 | 0.0239 | no |
-| **mean** | | | 909 | 35.03 | 92.9% | **-461.71** (s.e. 185) | 803.5 | 0.0711 | 0.0688 | 1 of 6 |
+| **mean** | | | 913 | 35.00 | 92.9% | **-469.12** (s.e. 185) | 797.5 | 0.0711 | 0.0688 | 1 of 6 |
 
 How the PnL arises (same runs, all fully resolved so nothing is unrealised; merge, flatten-sell and
 settlement PnL add up to the total, fees are already inside them):
 
 | Seed | Merge PnL | Flatten-sell PnL | Settlement PnL (pair + directional) | Fees paid (inside) | Total PnL | Merges / flatten sells (orders) | Quotes placed / cancelled | Post-only cancels |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | +1,723.3 | -1,386.0 | +1.7 | 135.3 | +339.0 | 365 / 20 | 27,504 / 26,327 | 944 |
-| 2 | +738.5 | -1,482.6 | -0.8 | 82.7 | -745.0 | 174 / 29 | 16,797 / 16,142 | 550 |
-| 3 | +1,170.8 | -1,396.4 | -17.3 | 104.2 | -242.9 | 262 / 48 | 24,919 / 24,029 | 740 |
-| 4 | +1,072.7 | -1,573.1 | +0.5 | 84.8 | -500.0 | 261 / 26 | 23,878 / 23,018 | 678 |
-| 5 | +847.9 | -1,575.2 | +0.8 | 87.0 | -726.4 | 220 / 32 | 21,965 / 21,247 | 570 |
-| 6 | +852.2 | -1,748.2 | +1.0 | 88.9 | -895.0 | 224 / 35 | 23,616 / 22,818 | 636 |
+| 1 | +1,719.7 | -1,361.5 | +1.8 | 136.8 | +359.9 | 368 / 20 | 27,533 / 26,350 | 947 |
+| 2 | +738.5 | -1,482.6 | -0.8 | 82.7 | -745.0 | 174 / 29 | 16,800 / 16,145 | 550 |
+| 3 | +1,179.4 | -1,497.5 | -17.3 | 102.1 | -335.4 | 270 / 48 | 24,836 / 23,925 | 756 |
+| 4 | +1,082.8 | -1,556.3 | +0.6 | 84.6 | -472.8 | 263 / 26 | 23,800 / 22,933 | 684 |
+| 5 | +847.9 | -1,575.2 | +0.8 | 87.0 | -726.4 | 220 / 32 | 21,964 / 21,246 | 570 |
+| 6 | +852.2 | -1,748.2 | +1.0 | 88.9 | -895.0 | 224 / 35 | 23,617 / 22,821 | 634 |
 
 Over **40 seeds** (`--seed 1..40 --windows 12`, same config) the default run gives a mean PnL
-of **-538.5 USDC** (standard error 62.5, sd 395.1, median -478.2, range
--1,162.4 to +339.0), positive in 2 of 40 runs, and the kill switch trips in 9 of
-them (a tripped run stops trading for the rest of its windows: 38 of the 960 markets have no
-fills, all of them in 7 tripped runs). Fills per run 333 to 1,264; average trade
-34.7 USDC (range 31.9 to 36.4, so the source claim of about 53 is not reproduced);
-pair completion 92.7% on average (87.1% to 95.7%); mean max drawdown 806.7
-(worst 1,281.9); mean merge PnL +1,054.4 and mean flatten-sell PnL -1,593.5; Brier score of
-the engine 0.0731, of the raw model 0.0743, of the market mid 0.0728.
+of **-535.9 USDC** (standard error 62.0, sd 392.3, median -480.0, range
+-1,126.1 to +359.9), positive in 2 of 40 runs, and the kill switch trips in 10 of
+them (a tripped run stops quoting for the rest of its windows: 38 of the 960 markets have
+no fills, all of them in 7 tripped runs; the tripped runs end between -1,126 and
+-745 USDC). Fills per run 328 to 1,264; average trade
+34.7 USDC (range 32.0 to 36.4, so the source claim of about 53 is not reproduced);
+pair completion 92.7% on average (86.9% to 95.7%); mean max drawdown 800.9
+(worst 1,281.9); mean merge PnL +1,055.4 and mean flatten-sell PnL -1,591.9 (the flatten
+sells lose more than the merges earn in 38 of the 40 seeds); Brier score of the engine
+0.0731, of the raw model 0.0743, of the market mid 0.0728.
 Read this as: on this simulator and with these uncalibrated defaults the strategy earns its pair
 margin through merges and gives all of it (and a good deal more) back on the inventory it has to dump.
-With instant cancels (the first version of the exchange) the same 40 seeds gave -120.0 USDC (positive in
-15, no kill switch trip); section 6.12 compares the two.
+With instant cancels (the first version's exchange model, rebuilt as a scratch variant of the current
+exchange†) the same 40 seeds give -118.2 USDC (s.e. 38.4, positive in 15, kill switch
+tripped 0 times); section 6.12 compares the two.
 
 ## 3. Variants (seeds 1 to 6, 12 windows each)
 
 | Variant | What changes | Fills (mean) | PnL mean (s.e.) | Seeds with PnL > 0 | Kill switch trips |
 |---|---|---:|---:|---:|---:|
-| default | nothing | 909 | -462 (185) | 1 of 6 | 1 of 6 |
+| default | nothing | 913 | -469 (185) | 1 of 6 | 1 of 6 |
 | btc_only | `--assets BTC` | 494 | -183 (148) | 1 of 6 | 0 of 6 |
-| informed0 | `sim.informed_flow=0` (no sweeps) | 528 | -22 (59) | 3 of 6 | 0 of 6 |
-| lag0 | `sim.market_lag_seconds=0` | 916 | -874 (111) | 0 of 6 | 5 of 6 |
-| nodir | `directional.enabled=false` | 878 | -769 (174) | 1 of 6 | 3 of 6 |
+| informed0 | `sim.informed_flow=0` (no sweeps) | 527 | -16 (62) | 4 of 6 | 0 of 6 |
+| lag0 | `sim.market_lag_seconds=0` | 910 | -947 (103) | 0 of 6 | 5 of 6 |
+| nodir | `directional.enabled=false` | 878 | -763 (179) | 1 of 6 | 3 of 6 |
 | feeheavy | `fees.taker_fee_rate=1.0`, `fees.maker_fee_rate=0.01` | 686 | -865 (80) | 0 of 6 | 3 of 6 |
 
 Standard errors are across the six seeds, so differences between rows of less than about two
@@ -112,58 +127,60 @@ default's because those knobs change neither the prices of the feed nor the mode
 | 6 | 12 x 900 s | BTC | 545 | 36.07 | 94.0% | -249.88 | 526.6 | 0.0239 | 0.0321 | no |
 | **mean** | | | 494 | 34.69 | 93.3% | **-183.03** (s.e. 148) | 496.0 | 0.0756 | 0.0732 | 0 of 6 |
 
-Half the markets, so about half the fills (494 against 909); the mean is 1.2 standard errors below zero.
+Half the markets, so about half the fills (494 against 913); the mean is
+1.2 standard errors below zero.
 
 ### 3.2 No adverse selection (`--set sim.informed_flow=0`)
 
 | Seed | Windows | Assets | Fills | Avg trade (USDC) | Pair completion | PnL (USDC) | Max drawdown (USDC) | Brier model | Brier market | Kill switch |
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| 1 | 12 x 900 s | BTC,ETH | 686 | 15.71 | 92.1% | +99.23 | 297.5 | 0.1211 | 0.1111 | no |
+| 1 | 12 x 900 s | BTC,ETH | 680 | 15.71 | 91.9% | +68.20 | 327.8 | 0.1211 | 0.1111 | no |
 | 2 | 12 x 900 s | BTC,ETH | 546 | 15.41 | 87.5% | -206.96 | 354.4 | 0.0931 | 0.0949 | no |
-| 3 | 12 x 900 s | BTC,ETH | 526 | 15.33 | 91.1% | +22.54 | 155.3 | 0.1043 | 0.1005 | no |
-| 4 | 12 x 900 s | BTC,ETH | 456 | 13.90 | 90.1% | +140.36 | 117.4 | 0.0739 | 0.0706 | no |
-| 5 | 12 x 900 s | BTC,ETH | 436 | 13.33 | 84.4% | -183.45 | 224.0 | 0.0131 | 0.0118 | no |
-| 6 | 12 x 900 s | BTC,ETH | 517 | 15.74 | 88.9% | -6.46 | 145.0 | 0.0209 | 0.0239 | no |
-| **mean** | | | 528 | 14.91 | 89.0% | **-22.46** (s.e. 59) | 215.6 | 0.0711 | 0.0688 | 0 of 6 |
+| 3 | 12 x 900 s | BTC,ETH | 524 | 15.41 | 91.4% | +40.59 | 146.9 | 0.1043 | 0.1005 | no |
+| 4 | 12 x 900 s | BTC,ETH | 458 | 13.84 | 90.3% | +159.42 | 117.4 | 0.0739 | 0.0706 | no |
+| 5 | 12 x 900 s | BTC,ETH | 434 | 13.39 | 84.2% | -203.41 | 244.0 | 0.0131 | 0.0118 | no |
+| 6 | 12 x 900 s | BTC,ETH | 519 | 15.76 | 89.3% | +45.50 | 111.3 | 0.0209 | 0.0239 | no |
+| **mean** | | | 527 | 14.92 | 89.1% | **-16.11** (s.e. 62) | 217.0 | 0.0711 | 0.0688 | 0 of 6 |
 
-With the informed sweeps switched off the only prints are random touch prints (0.3 per second per
-token side, about 30 shares), so the bot is filled about half as often as in the default run, in small clips
-(about 15 USDC), and pairs less completely (89%). The mean PnL is
-indistinguishable from zero. The average maker BUY fill is still 0.71 cent above the mid at the moment
-of the fill (section 6.4).
+With the informed sweeps switched off the only prints are the random touch prints (0.3 arrivals per
+second per market, each shown on both mirrored books, about 30 shares), so the bot is filled about
+half as often as in the default run (527 fills against 913), in small clips
+(about 15 USDC), and pairs less completely (89%). The mean PnL (-16.1, s.e. 62,
+positive in 4 of 6 seeds) is indistinguishable from zero. The average maker BUY fill is
+still 0.73 cent above the mid at the moment of the fill (section 6.4).
 
 ### 3.3 No market lag (`--set sim.market_lag_seconds=0`)
 
 | Seed | Windows | Assets | Fills | Avg trade (USDC) | Pair completion | PnL (USDC) | Max drawdown (USDC) | Brier model | Brier market | Kill switch |
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| 1 | 12 x 900 s | BTC,ETH | 1954 | 37.60 | 95.9% | -447.63 | 625.2 | 0.1340 | 0.1357 | no |
+| 1 | 12 x 900 s | BTC,ETH | 1956 | 37.51 | 95.9% | -446.28 | 625.2 | 0.1340 | 0.1357 | no |
 | 2 | 12 x 900 s | BTC,ETH | 681 | 37.13 | 92.5% | -1002.14 | 1002.1 | 0.0911 | 0.0904 | TRIPPED |
 | 3 | 12 x 900 s | BTC,ETH | 426 | 38.36 | 88.6% | -977.32 | 1221.7 | 0.1120 | 0.1154 | TRIPPED |
-| 4 | 12 x 900 s | BTC,ETH | 1369 | 36.85 | 93.8% | -631.85 | 1278.2 | 0.0756 | 0.0729 | TRIPPED |
+| 4 | 12 x 900 s | BTC,ETH | 1328 | 36.69 | 93.6% | -1069.49 | 1184.6 | 0.0756 | 0.0729 | TRIPPED |
 | 5 | 12 x 900 s | BTC,ETH | 390 | 34.80 | 87.0% | -1159.44 | 1189.6 | 0.0143 | 0.0139 | TRIPPED |
 | 6 | 12 x 900 s | BTC,ETH | 679 | 37.04 | 91.8% | -1026.45 | 1129.4 | 0.0191 | 0.0194 | TRIPPED |
-| **mean** | | | 916 | 36.96 | 91.6% | **-874.14** (s.e. 111) | 1074.4 | 0.0743 | 0.0746 | 5 of 6 |
+| **mean** | | | 910 | 36.92 | 91.6% | **-946.85** (s.e. 103) | 1058.8 | 0.0743 | 0.0746 | 5 of 6 |
 
 The market now sees the spot with no delay, so the model has nothing to find and the sweeps still
-pick the resting bids off. This is the worst variant: 5 of the six seeds trip the kill switch (equity 1,000 USDC
-below the start), after which the remaining windows are not traded, so a tripped run ends close to
-the limit rather than at a larger loss.
+pick the resting bids off. This is the worst variant: 5 of the six seeds trip the kill
+switch (equity 1,000 USDC below the start), after which the remaining windows are not traded, so a
+tripped run ends close to the limit (-1,159 to -977) rather than at a larger loss.
 
 ### 3.4 Directional overlay off (`--set directional.enabled=false`)
 
 | Seed | Windows | Assets | Fills | Avg trade (USDC) | Pair completion | PnL (USDC) | Max drawdown (USDC) | Brier model | Brier market | Kill switch |
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| 1 | 12 x 900 s | BTC,ETH | 1498 | 35.40 | 96.6% | +11.94 | 465.7 | 0.1211 | 0.1111 | no |
-| 2 | 12 x 900 s | BTC,ETH | 950 | 34.26 | 93.1% | -1031.02 | 1031.0 | 0.0931 | 0.0949 | TRIPPED |
+| 1 | 12 x 900 s | BTC,ETH | 1505 | 35.43 | 96.6% | +48.10 | 442.5 | 0.1211 | 0.1111 | no |
+| 2 | 12 x 900 s | BTC,ETH | 951 | 34.27 | 93.1% | -1018.65 | 1018.7 | 0.0931 | 0.0949 | TRIPPED |
 | 3 | 12 x 900 s | BTC,ETH | 922 | 35.59 | 93.4% | -908.08 | 1043.1 | 0.1043 | 0.1005 | no |
-| 4 | 12 x 900 s | BTC,ETH | 910 | 34.44 | 93.7% | -566.84 | 775.6 | 0.0739 | 0.0706 | no |
+| 4 | 12 x 900 s | BTC,ETH | 905 | 34.30 | 93.6% | -578.49 | 787.2 | 0.0739 | 0.0706 | no |
 | 5 | 12 x 900 s | BTC,ETH | 540 | 34.04 | 88.6% | -1088.09 | 1091.0 | 0.0131 | 0.0118 | TRIPPED |
 | 6 | 12 x 900 s | BTC,ETH | 448 | 35.62 | 89.6% | -1034.31 | 1043.2 | 0.0209 | 0.0239 | TRIPPED |
-| **mean** | | | 878 | 34.89 | 92.5% | **-769.40** (s.e. 174) | 908.3 | 0.0711 | 0.0688 | 3 of 6 |
+| **mean** | | | 878 | 34.87 | 92.5% | **-763.25** (s.e. 179) | 904.3 | 0.0711 | 0.0688 | 3 of 6 |
 
-Worse than the default in 6 of six seeds (paired by seed). The only difference is the overlay, which
-uses the 2-second lag that the simulator builds in on purpose, so this gap is a property of the
-simulator and not evidence of a real edge.
+Worse than the default in 6 of the 6 seeds (paired by seed). The only difference is the
+overlay, which uses the 2-second lag that the simulator builds in on purpose, so this gap is a
+property of the simulator and not evidence of a real edge.
 
 ### 3.5 Fee-heavy (`--set fees.taker_fee_rate=1.0 --set fees.maker_fee_rate=0.01`)
 
@@ -177,148 +194,175 @@ simulator and not evidence of a real edge.
 | 6 | 12 x 900 s | BTC,ETH | 332 | 32.08 | 85.6% | -1000.21 | 1010.7 | 0.0209 | 0.0239 | TRIPPED |
 | **mean** | | | 686 | 32.27 | 90.1% | **-865.02** (s.e. 80) | 940.7 | 0.0711 | 0.0688 | 3 of 6 |
 
-Taker fees four times the default and a 1% maker fee on notional. Fees paid rise from 83-135
-to 134-545 USDC per run; the independent recomputation of cash from the raw fills (section 6.10)
-agrees to 1e-6 with the fee formula applied independently.
+Taker fees four times the default and a 1% maker fee on notional. Fees paid rise from
+83-137 to 134-545 USDC per run; the independent
+recomputation of cash from the raw fills (section 6.10) agrees to 1e-6 with the fee formula applied
+independently.
 
 ## 4. Sensitivity runs: why the numbers look the way they do (not tuning)
 
 These rows change one assumption at a time to expose a mechanism (section 6.1). They are NOT an
 attempt to find better parameters, no default was changed, and with three seeds the PnL columns
-are noise (the standard error of a three-seed mean is 120 to 313 USDC across these rows).
+are noise (the standard error of a three-seed mean is 124 to 322 USDC across these rows).
 
 | Variant (seeds 1-3) | Fills (mean) | Avg trade (USDC) | Pair completion | PnL per seed (USDC) | PnL mean | Quotes placed per snapshot | Post-only cancels (mean) | Rate-limited placements (mean) |
 |---|---:|---:|---:|---|---:|---:|---:|---:|
-| default (latency 1, tolerance 0) | 962 | 35.09 | 93.4% | +339, -745, -243 | -216 | 1.07 | 745 | 23 |
-| `exchange.latency_ticks=0` | 1340 | 38.34 | 96.4% | +598, -131, +95 | +187 | 1.33 | 0 | 43 |
-| `exchange.latency_ticks=2` | 1194 | 36.14 | 93.7% | -324, -1043, -1077 | -815 | 0.78 | 911 | 20 |
-| `exchange.latency_ticks=3` | 1198 | 36.04 | 92.7% | -493, -1020, -804 | -772 | 0.73 | 1471 | 30 |
-| `sizing.requote_tolerance_ticks=1` | 1109 | 35.38 | 94.8% | +487, -195, -420 | -42 | 0.97 | 739 | 8 |
+| default (latency 1, tolerance 0) | 968 | 35.04 | 93.4% | +360, -745, -335 | -240 | 1.07 | 751 | 25 |
+| `exchange.latency_ticks=0` | 1342 | 38.36 | 96.4% | +603, -127, +116 | +197 | 1.34 | 0 | 46 |
+| `exchange.latency_ticks=2` | 1204 | 36.30 | 93.7% | -325, -639, -1045 | -670 | 0.79 | 914 | 19 |
+| `exchange.latency_ticks=3` | 1199 | 36.04 | 92.7% | -491, -1020, -804 | -771 | 0.73 | 1473 | 30 |
+| `sizing.requote_tolerance_ticks=1` | 1109 | 35.37 | 94.8% | +487, -195, -436 | -48 | 0.97 | 739 | 8 |
 | `sizing.requote_tolerance_ticks=2` | 980 | 35.95 | 94.5% | +388, -322, -424 | -119 | 0.81 | 633 | 5 |
-| `sim.window_seconds=300`, 36 windows | 1229 | 34.61 | 90.3% | -658, -1073, -884 | -872 | 0.85 | 1300 | 21 |
+| `sim.window_seconds=300`, 36 windows | 1225 | 34.59 | 90.4% | -690, -1097, -1008 | -932 | 0.85 | 1287 | 19 |
 
-The fill count does not collapse as the latency goes from 0 to 3 snapshots (1,340, 962, 1,194,
-1,198): a cancel takes as long as an order, so a quote that is re-priced every snapshot stays
-hittable for `latency_ticks` snapshots after the engine dropped it. What changes with latency is the
-PnL (+187, -216, -815, -772 for latency 0 to 3), because the stale quotes are the ones the price is
-leaving. Every number the backtest prints is therefore still dominated by the latency and queue
-assumptions of the paper exchange. (With instant cancels this sweep read 1,340 / 514 / 227 / 117
-fills, "a factor of 11": largely an artefact, section 6.12.)
+The fill count does not collapse as the latency goes from 0 to 3 snapshots (1,342,
+968, 1,204, 1,199): a cancel takes as long as an order, so a quote that is
+re-priced every snapshot stays hittable for `latency_ticks` snapshots after the engine dropped it.
+What changes with latency is the PnL (+197, -240, -670, -771 for
+latency 0 to 3; all three seeds are worse at latency 3 than at latency 0, but the steps from 1 to 2 to
+3 are within the noise), because the stale quotes are the ones the price is leaving. Every number the
+backtest prints is therefore still dominated by the latency and queue assumptions of the paper
+exchange. (The first version of the exchange, whose cancels were instant, read 1,340 / 514 / 227 /
+117 fills for this sweep, "a factor of 11": largely an artefact, section 6.12.)
+
+How to read the tolerance rows: `requote_tolerance_ticks` is one-sided. A resting bid is kept only if
+it is at most that many ticks **below** the price the engine now wants (and its remaining size is 80%
+to 100% of the desired size); a bid priced **above** the new desired price is always cancelled,
+whatever the tolerance (DESIGN 2.8, `engine._reconcile`). The touch moving down, the direction that
+hurts a resting bid, therefore always re-prices the ladder, and the tolerance only spares orders when
+the touch moves up. That is why raising it to 1 and 2 ticks removes only part of the churn (quotes
+placed per snapshot 1.07 to 0.97 and 0.81; post-only cancels, fills and PnL show no
+trend beyond noise: 968, 1,109, 980 fills and -240, -48, -119 USDC).
 
 ## 5. Full simulated days and speed
 
 | Run | Assets | Windows | Markets | Snapshots | Wall time | Fills | Avg trade (USDC) | Pair completion | PnL (USDC) | Max drawdown (USDC) | Brier model | Brier market | Kill switch |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| BTC day, seed 1 | BTC | 96 x 900 s | 96 | 86,400 | 16.1 s | 2450 | 34.70 | 94.0% | -1073.64 | 1596.9 | 0.0518 | 0.0493 | TRIPPED |
-| BTC day, seed 2 | BTC | 96 x 900 s | 96 | 86,400 | 12.4 s | 922 | 35.42 | 91.3% | -919.86 | 1021.1 | 0.1013 | 0.1016 | TRIPPED |
-| BTC day, seed 3 | BTC | 96 x 900 s | 96 | 86,400 | 15.1 s | 1992 | 34.20 | 93.4% | -1017.92 | 1195.1 | 0.0923 | 0.0895 | TRIPPED |
-| BTC+ETH day, seed 1 | BTC,ETH | 96 x 900 s | 192 | 172,800 | 26.9 s | 2010 | 34.54 | 93.5% | -966.58 | 1698.2 | 0.0662 | 0.0640 | TRIPPED |
-| BTC day, seed 1, kill switch off | BTC | 96 x 900 s | 96 | 86,400 | 21.7 s | 4361 | 34.93 | 94.2% | -1227.05 | 1786.4 | 0.0518 | 0.0493 | no |
-| BTC day, seed 2, kill switch off | BTC | 96 x 900 s | 96 | 86,400 | 21.2 s | 3959 | 34.86 | 93.5% | -2423.69 | 2552.3 | 0.1013 | 0.1016 | no |
-| BTC day, seed 3, kill switch off | BTC | 96 x 900 s | 96 | 86,400 | 22.6 s | 4041 | 34.67 | 93.8% | -1595.52 | 1772.7 | 0.0923 | 0.0895 | no |
-| BTC+ETH day, seed 1, kill switch off | BTC,ETH | 96 x 900 s | 192 | 172,800 | 49.9 s | 8461 | 34.89 | 94.2% | -2666.81 | 3709.6 | 0.0662 | 0.0640 | no |
+| BTC day, seed 1 | BTC | 96 x 900 s | 96 | 86,400 | 16.9 s | 2450 | 34.70 | 94.0% | -1073.64 | 1596.9 | 0.0518 | 0.0493 | TRIPPED |
+| BTC day, seed 2 | BTC | 96 x 900 s | 96 | 86,400 | 12.8 s | 922 | 35.42 | 91.3% | -919.86 | 1021.1 | 0.1013 | 0.1016 | TRIPPED |
+| BTC day, seed 3 | BTC | 96 x 900 s | 96 | 86,400 | 16.2 s | 1992 | 34.20 | 93.4% | -1017.92 | 1195.1 | 0.0923 | 0.0895 | TRIPPED |
+| BTC+ETH day, seed 1 | BTC,ETH | 96 x 900 s | 192 | 172,800 | 26.1 s | 2123 | 34.79 | 93.9% | -1072.19 | 1688.2 | 0.0662 | 0.0640 | TRIPPED |
+| BTC day, seed 1, kill switch off | BTC | 96 x 900 s | 96 | 86,400 | 23.2 s | 4361 | 34.93 | 94.2% | -1227.05 | 1786.4 | 0.0518 | 0.0493 | no |
+| BTC day, seed 2, kill switch off | BTC | 96 x 900 s | 96 | 86,400 | 22.2 s | 3959 | 34.86 | 93.5% | -2423.69 | 2552.3 | 0.1013 | 0.1016 | no |
+| BTC day, seed 3, kill switch off | BTC | 96 x 900 s | 96 | 86,400 | 23.4 s | 4041 | 34.67 | 93.8% | -1595.52 | 1772.7 | 0.0923 | 0.0895 | no |
+| BTC+ETH day, seed 1, kill switch off | BTC,ETH | 96 x 900 s | 192 | 172,800 | 50.7 s | 8485 | 34.89 | 94.2% | -2573.79 | 3639.1 | 0.0662 | 0.0640 | no |
 
 The first four rows are the default configuration. Over a full simulated day the kill switch trips
-(its loss limit is measured against the start of the run, not per calendar day, section 8), after
-which nothing is traded, so those wall times are shorter than for a day that is traded throughout.
-The last four rows switch it off (`--set risk.max_daily_loss_usd=1e12`, a timing device and not a
-configuration to trade; the CLI prints a `warning:` on stderr that the kill switch can never fire)
-so that the whole day is traded; they lose 1,227 to 2,667 USDC, more than
-the 1,000 USDC the default configuration tolerates.
+in all four (its loss limit is measured against the start of the run, not per calendar
+day, section 8), after which nothing is traded, so those wall times are shorter than for a day that
+is traded throughout. The last four rows switch it off (`--set risk.max_daily_loss_usd=1e12`, a timing
+device and not a configuration to trade; the CLI prints a `warning:` on stderr that the kill switch
+can never fire) so that the whole day is traded; they lose 1,227 to 2,574 USDC, more
+than the 1,000 USDC the default configuration tolerates. Wall time is the whole CLI process
+(interpreter start-up included), one run at a time on an otherwise idle machine†.
 
-One BTC asset-day traded throughout (96 windows, 86,400 snapshots) takes about 21-23 s with the
-invariant checks on (about 0.25 ms per snapshot); two assets take 49.9 s, so about 25 s per
-simulated asset-day. The cost per snapshot does not grow with the length of the run (0.269, 0.234,
-0.241 and 0.264 ms per snapshot for 12, 48, 96 and 192 BTC windows without invariant checks, kill
-switch off). Before the first pass a BTC day took 29.4 s and a two-asset day 67.4 s (the exchange's
-self-check rebuilt long error messages on every call; section 7).
+One BTC asset-day traded throughout (96 windows, 86,400 snapshots) takes 22.2 to
+23.4 s with the invariant checks on (0.26 to 0.27 ms per snapshot); two assets
+take 50.7 s, so about 25 s per simulated asset-day (0.29 ms per snapshot).
+The cost per snapshot does not grow with the length of the run (one BTC asset, seed 1, kill switch
+off, `--no-invariants`, 12 to 192 windows)†:
 
-That sentence was only true up to a few hundred markets. `Portfolio.capital_at_risk()` and
-`Portfolio.equity()` run several times per snapshot and used to walk every inventory the run had ever
-created, settled ones included, so a snapshot cost in proportion to the markets already settled and a
-run was quadratic in its markets. They now walk only the unsettled inventories (DESIGN 4.1), and
-the sums keep their order, so every number of every run is unchanged. The engine's cost per snapshot
-over the last 5% of a run against the first 5% (60 s windows, one BTC asset, kill switch off, no
-invariant checks, seed 2) was x1.6, x3.3 and x6.3 for 200, 800 and 1,600 markets (the 1,600-market run
-took 52 s) and is now x1.0, x1.2 and x1.3 (19 s). What is left of the 20-30% is the interpreter's
-cyclic garbage collector walking the events the timing script keeps in memory, not a scan (x0.94 at
-800 markets with the collector switched off). A `capital_at_risk() + equity({})` pair after 100,000
-settled markets takes 0.0005 ms where it took 21 ms (0.002 ms with 4 markets open). At the 96 and
-192 markets of the table the gain is small (a 96-window BTC day with the invariant checks on: 22.5 s
-to 21.1 s; BTC and ETH: 53.9 s to 44.5 s on the same machine), and the wall times in the table were
-measured before the change. The durable guard is
-`test_portfolio_totals_do_not_visit_settled_inventories`; the timings came from a throwaway script
-around `engine.on_snapshot`.
+| BTC windows | Snapshots | Wall time | ms per snapshot |
+|---:|---:|---:|---:|
+| 12 | 10,800 | 3.1 s | 0.286 |
+| 48 | 43,200 | 11.1 s | 0.258 |
+| 96 | 86,400 | 23.5 s | 0.272 |
+| 192 | 172,800 | 45.9 s | 0.266 |
+
+That was not always true. `Portfolio.capital_at_risk()` and `Portfolio.equity()` run several times
+per snapshot and used to walk every inventory the run had ever created, settled ones included, so
+a snapshot cost in proportion to the markets already settled and a run was quadratic in its markets.
+They now walk only the unsettled inventories (DESIGN 4.1), and the sums keep their order, so every
+number of every run is unchanged. The engine's cost per snapshot over the last 5% of a run against
+the first 5% (60 s windows, one BTC asset, kill switch off, no invariant checks, seed 2), measured
+with a timing script that wraps `engine.on_snapshot`† on the code before and after that change, was
+x1.5, x3.1 and x5.5 for 200, 800 and 1,600 markets and is now
+x1.1, x1.0 and x1.0; the 1,600-market run took 48 s
+before and 20 s after. A `capital_at_risk() + equity({})` pair with 100,000 settled
+markets and none open took 21 ms before and takes 0.0006 ms now; with 4 markets open and 10,000
+settled it took 2.0 ms before and takes 0.002 ms now. The tree before the change was never committed, so the
+"before" figures cannot be reproduced from the repository; the "after" figures can be re-measured with
+any timing script around `engine.on_snapshot`. The durable guard is
+`test_portfolio_totals_do_not_visit_settled_inventories`. At the 96 and 192 markets of the table above
+the gain is small.
 
 ## 6. Review of anomalies and root causes
 
 The pass looked for the problems listed below. Where a problem was found, its cause is given and the
 verdict says whether it is a bug (fixed, with a test) or what the strategy does under the
-simulator's assumptions (documented, parameters not touched). No functional defect was found in
-the modules' integration: the invariant checks, the independent audits of section 6.10, 450
-randomised configurations and 48 corrupted-data runs all came back clean. (A later review found two
-flaws of the paper exchange that none of these checks could see, because neither breaks an
-accounting rule: cancels took no time, section 6.12, and the mirrored books did not share IOC
-depth, section 6.13. A third review found that the report of a run with open markets mixed resolved-only and
-all-market figures and overstated what had been checked, section 6.14. A fourth found that a scarce cash
-budget and a binding rate limit were handed out UP-first instead of to the token that completes pairs,
-section 6.15.)
+simulator's assumptions (documented, parameters not touched). No accounting defect was found: the
+invariant checks, the independent audits of section 6.10, 450 randomised configurations† and
+48 corrupted-data runs† all came back clean. One non-accounting interplay of two in-flight IOC
+orders at latency 3 is open (6.8, section 8, item 12). (Later reviews found flaws of the paper
+exchange that none of these checks could see, because neither breaks an accounting rule: cancels took
+no time, section 6.12, and the mirrored books did not share IOC depth, section 6.13. A third review
+found that the report of a run with open markets mixed resolved-only and all-market figures and
+overstated what had been checked, section 6.14. A fourth found that a scarce cash budget and a binding
+rate limit were handed out UP-first instead of to the token that completes pairs, section 6.15.)
 
 ### 6.1 Quote churn and the fill count (by design under the simulator's assumptions)
 
-* Finding: the default run places 1.27 quotes and cancels 1.22 per snapshot (seed 1: 27,504 placed and
-  26,327 cancelled over 21,600 snapshots). Of the 27,504 post-only orders, **79.1% lasted one snapshot** (the engine
-  cancelled them at the next snapshot, or a fill or the exchange's post-only re-check ended them then;
-  14.6% lasted two, 3.1% three, 3.2% four or more), 93.4% ended by a cancel that landed, 3.4% by the exchange's
-  post-only re-check and 3.2% by a complete fill; 1,035 (3.8%) ever received a fill.
+* Finding: the default run places 1.27 quotes and cancels 1.22 per snapshot (seed 1: 27,533
+  placed and 26,350 cancelled over 21,600 snapshots). Of the 27,533 post-only orders†, **79.3%
+  lasted one snapshot** (the engine cancelled them at the next snapshot, or a fill or the exchange's
+  post-only re-check ended them then; 14.4% lasted two, 3.1% three, 3.2% four or more), 93.4%
+  ended by a cancel that landed, 3.4% by the exchange's post-only re-check and 3.2% by a
+  complete fill; 1,040 (3.8%) ever received a fill (post-only orders only: the IOC
+  orders are counted separately).
 * Root cause: (1) in this simulator the book moves almost every second. The UP best bid changes on
-  73.1% of ticks (84.6% for either side; a move of two ticks or more on 37.1% of ticks), because
+  73.1% of ticks (84.6% for either side; a move of two ticks or more on 37.1% of ticks)†, because
   a binary option's price moves by about `0.4 / sqrt(seconds left)` per second (1.6 ticks per second
   with 600 s left, 4 ticks with 100 s left). (2) The ladder is priced off the touch and
-  `requote_tolerance_ticks` is 0, so any move re-prices it. (3) An order placed at snapshot `t`
-  goes live at `t+1`; if the engine re-prices at `t+1`, its cancel lands at `t+2`, so it can still
-  meet the prints of `t+2`. Every order that goes live is matchable for at least `latency_ticks`
-  snapshots after the engine decided to drop it: of the 26,560 orders that went live, 78.8% were
-  matchable for exactly one snapshot, 14.8% for two, 3.1% for three and 3.3% for four or more.
-  (With instant cancels the first group was never matchable at all, and the first version of this
-  section called that "by design"; section 6.12 explains why it was an artefact.)
-* Consequence: 805 of the 1,110 maker fills (72.5%), carrying 68.7% of the maker shares, came from
-  orders the engine had already cancelled (seeds 2 and 3: 74.3% and 73.7%). They are worse than the
-  other fills: the size-weighted maker BUY markout against the token's mid is -1.40 cents at the moment of
-  the fill against -1.07 for the others, -1.00 against -0.04 five seconds later and -0.71 against +0.49
-  after thirty (section 6.4).
-* Evidence for the mechanism (three-seed means, section 4): raising `requote_tolerance_ticks` to 1 and 2 cuts quotes
-  placed per snapshot from 1.07 to 0.97 and 0.81, with fills of 962, 1,109 and 980
-  (no trend beyond noise); and the latency sweep gives 1,340, 962, 1,194 and 1,198 fills at latency 0, 1, 2 and 3
-  with PnL +187, -216, -815 and -772.
+  `requote_tolerance_ticks` is 0, so any move re-prices it (and a tolerance only helps when the
+  touch moves up, section 4). (3) An order placed at snapshot `t` goes live at `t+1`; if the engine
+  re-prices at `t+1`, its cancel lands at `t+2`, so it can still meet the prints of `t+2`. Every
+  order that goes live is matchable for at least `latency_ticks` snapshots after the engine decided
+  to drop it: of the 26,586 orders that went live, 78.9% were matchable for exactly one snapshot,
+  14.7% for two, 3.1% for three and 3.3% for four or more†. (With instant cancels the first group
+  was never matchable at all, and the first version of this section called that "by design"; section
+  6.12 explains why it was an artefact.)
+* Consequence: 810 of the 1,114 maker fills (72.7%), carrying 68.6% of the
+  maker shares, came from orders the engine had already cancelled (seeds 2 and 3: 74.3% and
+  73.1%)†. They are worse than the other fills: the size-weighted maker BUY markout against the
+  token's mid is -1.40 cents at the moment of the fill against -1.08 for the others,
+  -1.05 against +0.02 five seconds later and -0.79 against +0.67 after
+  thirty (section 6.4)†.
+* Evidence for the mechanism (three-seed means, section 4): raising `requote_tolerance_ticks` to 1 and 2
+  cuts quotes placed per snapshot from 1.07 to 0.97 and 0.81, with fills of 968,
+  1,109 and 980 (no trend beyond noise); and the latency sweep gives 1,342,
+  968, 1,204 and 1,199 fills at latency 0, 1, 2 and 3 with PnL +197,
+  -240, -670 and -771.
 * Verdict: not a bug. It is how the default parameters interact with a fast book and a 1-snapshot
   latency, and it has a price once cancels take time: the quotes it leaves behind are hit, and they
   are the adversely selected ones. Left as is; the rate limiter (20 messages per second, cancels
-  included) clipped 35 of 27,504 placements (0.13%), all of them quote placements, never a flatten sell or a
-  taker completion.
+  included) clipped 37 of 27,533 placements (0.13%), all of them quote placements, never a
+  flatten sell or a taker completion†.
 
 ### 6.2 Merges versus flatten sells (by design)
 
-* Finding: in every variant merge PnL is positive and flatten-sell PnL is negative, and the second is
-  usually larger (default seed 1: +1,723.3 and -1,386.0; the second is larger in five of the six seeds of section 2).
-* Root cause: pairs complete when the price comes back through the second bid, and they pay a
-  margin of 3.8 cents per merged pair here (0.9622 all-in cost, against a 1 cent target); what is
-  left unpaired is the inventory whose opposite bid the price never came back to, so it is selected
-  to have moved against the bot. Decomposing the flatten sells
-  exactly (seeds 1 to 3, 4,085 / 4,517 / 4,224 shares): -1,386.0 / -1,482.6 / -1,396.4 USDC is
-  -1,361.3 / -1,441.0 / -1,365.0 of price drift (mid at the sale minus average cost), -24.6 / -38.1 / -30.9
-  of spread paid against the mid and 0.003 / 3.56 / 0.45 of fees. So about 98% of the loss is
-  inventory risk and only about 2% is execution cost.
+* Finding: in every run of this file merge PnL is positive and flatten-sell PnL is negative, and the
+  flatten loss is usually the larger of the two: it is the larger in 5 of the six seeds of section 2
+  and in 38 of the 40 (default seed 1 is the exception among the six: +1,719.7 and -1,361.5).
+* Root cause: pairs complete mostly when the price comes back through the second bid (the rest are IOC
+  completion buys at the ask, allowed only when the net margin after the taker fee is at least 0.5 cent;
+  taker fills, completions and flatten sells together are 22% of the traded volume in seed 1), and they
+  pay a margin of 3.8 cents per merged pair here (0.9623 all-in cost in seed 1, 0.9663 on average
+  over 40 seeds, against a 1 cent target); what is left unpaired is the inventory whose opposite bid
+  the price never came back to, so it is selected to have moved against the bot. Decomposing the flatten
+  sells exactly† (seeds 1 to 3, 4,105 / 4,517 / 4,305 shares): -1,361.5 / -1,482.6 / -1,497.5 USDC is -1,336.8 / -1,441.0 / -1,465.7 of price drift (mid at the
+  sale minus average cost), -24.7 / -38.1 / -31.3 of spread paid against the mid and 0.003 / 3.56 / 0.45 of fees. So about
+  98% of the loss is inventory risk and only about 2% is execution cost.
 * Verdict: what the strategy does under these assumptions; no parameter touched.
 
 ### 6.3 Pair cost above 1 (not seen in these runs; accounting attribution, not a bug)
 
-* Finding: none of the 2,184 markets of the 88 runs of this file merged pairs at an average cost
-  above 1 (a default run merges at about 0.96). The first version of this file, which ran with instant
-  cancels, found three such markets among 2,328: `BTC-1700001000-900s` of `informed0` seed 1 (124 pairs at 1.0244,
-  -3.03 USDC), `ETH-1700007300-900s` of `latency2` seed 2 (49 pairs at 1.0341, -1.67 USDC) and
-  `ETH-1700005500-900s` of default seed 30 (22 pairs at 1.0030, -0.07 USDC). Different fills mean
-  different markets, so their absence here says nothing about the mechanism below.
+* Finding: none of the 2,184 markets of the 88 runs of this file merged pairs at an
+  average cost above 1 (a default run merges at about 0.96). The first version of this file (commit
+  `d6b60fa`, instant cancels, an earlier engine), found three such markets among 2,328:
+  `BTC-1700001000-900s` of `informed0` seed 1 (124 pairs at 1.0244, -3.03 USDC), `ETH-1700007300-900s`
+  of `latency2` seed 2 (49 pairs at 1.0341, -1.67 USDC) and `ETH-1700005500-900s` of default seed 30
+  (22 pairs at 1.0030, -0.07 USDC). Different fills mean different markets, so their absence here
+  says nothing about the mechanism below.
 * Root cause (traced snapshot by snapshot for the first of those): the bot held 35 UP at 0.61 and 68 DOWN at
   0.361, so DOWN was the heavy token and only UP counted as "completing". It then bought 56.6 more
   DOWN at 0.74, which the rules allow: a token that is not completing is bid at `fair - margin/2`,
@@ -332,79 +376,90 @@ section 6.15.)
 ### 6.4 Maker fills are picked off even without informed flow (by design)
 
 * Finding: size-weighted maker BUY markouts (mid of the token `h` seconds after the fill, minus the
-  fill price, in cents per share) for default seed 1 are -1.29 at 0 s, -1.12 at 1 s, -0.70 at 5 s,
-  -0.70 at 10 s, -0.33 at 30 s and -0.30 at 60 s. With `informed_flow=0` they are -0.71, -0.66,
-  -0.65, -0.60, +0.09 and +0.11.
+  fill price, in cents per share)† for default seed 1 are -1.30 at 0 s, -1.12 at 1 s,
+  -0.72 at 5 s, -0.71 at 10 s, -0.33 at 30 s and -0.22 at 60 s. With
+  `informed_flow=0` they are -0.73, -0.69, -0.70, -0.67, +0.06 and
+  +0.05.
 * Root cause: the exchange fills a resting order mainly through prints that go THROUGH its price
   (an at-the-touch print first drains the whole displayed queue, about 400 shares, against prints
   of about 30), and a print goes through only after the touch has already moved away from the order.
   This is the pessimistic queue assumption of DESIGN section 5. A second effect appeared once
-  cancels took time: 72.5% of the default run's maker fills come from orders the engine had already cancelled, and
-  their markouts are worse (-1.40 at the fill and -1.00 after 5 s, against -1.07 and -0.04 for the rest).
+  cancels took time: 72.7% of the default run's maker fills come from orders the engine had
+  already cancelled, and their markouts are worse (-1.40 at the fill and -1.05 after 5 s,
+  against -1.08 and +0.02 for the rest).
 * Verdict: by design.
 
 ### 6.5 Zero or very few fills (none unexpected)
 
-* The default config fills 333 to 1,264 times per run. Of the 960 markets of the 40-seed
+* The default config fills 328 to 1,264 times per run. Of the 960 markets of the 40-seed
   sweep, 922 traded; the other 38 are the windows that a tripped kill switch left
-  untraded (7 of the 9 tripped runs have such windows). Lower counts appear exactly where they should: 528 fills with no
-  sweeps (six-seed mean) and 494 with a single asset.
-* In a fresh 450-configuration random sweep (cash 500 to 100,000, latency 0 to 3, tick 0.001 to 0.02,
-  fees on and off, tiny capital caps and rate limits, 2 windows of 300 s; the sweep of the first version
-  of this file was not kept, so this is a new one, not a re-run) 85 runs had zero fills. 34 had no prints at all
-  (`uninformed_trades_per_sec=0` and `informed_flow=0`). 50 had every ladder level below the 20-share minimum order (a
-  10-share clip), so the quoter correctly placed nothing instead of sending orders to be rejected. The remaining one had quotes but no
-  fills: latency 3, `queue_ahead_fraction=2`, `trade_fill_fraction=0.5` and a 2-tick spread gate. To make sure none of
-  the other runs hides a fill the exchange should have made, all 450 runs were instrumented: whenever a live,
-  non-cancelled resting order faced a print that traded through its price, the best-priority such order
-  was filled (3,316 occasions, 0 exceptions). Verdict: expected, no bug.
+  untraded (7 of the 10 tripped runs have such windows). Lower counts appear exactly where
+  they should: 527 fills with no sweeps (six-seed mean) and 494 with a single asset.
+* In a 450-configuration random sweep† (cash 500 to 100,000, latency 0 to 3, tick 0.001 to 0.02, fees on and off,
+  tiny capital caps and rate limits, 2 windows of 300 s) 85 runs had zero fills. 34 had no
+  prints at all (`uninformed_trades_per_sec=0` and `informed_flow=0`). 50 had every ladder
+  level below the 20-share minimum order (a 10-share clip), so the quoter correctly placed nothing instead
+  of sending orders to be rejected. The remaining one had quotes but no fills: latency 3,
+  `queue_ahead_fraction=2`, `trade_fill_fraction=0.5` and a 2-tick spread gate. To make sure none of the
+  other runs hides a fill the exchange should have made, all 450 runs were instrumented: whenever a
+  live, non-cancelled resting order faced a print that traded through its price, the best-priority such
+  order was filled (3,867 occasions, 0 exceptions). Verdict: expected, no bug.
 
 ### 6.6 Fills on one side only (not found)
 
-Over the 40-seed sweep the bot bought 1,338,846 UP and 1,337,372 DOWN shares (50.0% UP). Per market the net
-imbalance is not bounded by the caps, see 6.7.
+Over the 40-seed sweep the bot bought 1,338,358 UP and 1,336,391 DOWN shares (50.0% UP). Per market the
+net imbalance is not bounded by the caps, see 6.7.
 
 ### 6.7 Inventory piling up unhedged (bounded softly)
 
-* Largest net imbalance seen: 407.8 with the overlay off (cap 300); 583.5 with it on (cap 300 plus 200
-  directional); largest gross inventory 1,106 shares (cap 1,500 per side); largest capital at risk
-  in a market 550.5 USDC (cap 1,500). The first two are above their caps (300 and 470 were seen with instant cancels):
-  the caps bound what the engine rests, and an order it has cancelled can still fill until its
-  cancel lands (6.12).
-* Markets ending with 1 share or more unpaired: 14 of 960, 13 of them holding 1.2 to 4.8 shares (less
-  than the 5-share minimum order, so they cannot be sold) and one holding 43.2.
-* The `holds` engine counter is 900 over the 960 markets of the default sweep because it counts any
-  unpaired remainder held at FLATTEN, dust included; it does not mean 900 directional bets.
-* The larger unhedged exit (default seed 3, `ETH-1700001900-900s`, 43.2 UP shares): flatten sells are IOC
+* Largest net imbalance seen: 407.8 with the overlay off (cap 300); 583.5 with it on (cap
+  300 plus 200 directional); largest gross inventory 1,106 shares (cap 1,500 per side); largest
+  capital at risk in a market 550.5 USDC (cap 1,500). The first two are above their caps (the first
+  version of this file, with instant cancels, saw 300 and 470): the caps bound what the engine rests, and
+  an order it has cancelled can still fill until its cancel lands (6.12).
+* Markets ending with 1 share or more unpaired: 14 of 960, 13 of them holding 1.2 to
+  4.8 shares (less than the 5-share minimum order, so they cannot be sold) and 1 holding
+  43.2.
+* The `holds` engine counter counts the markets whose FLATTEN decided to hold an unpaired remainder to
+  resolution (once per market; remainders below the minimum order size, which cannot be sold, are
+  counted too). It is 900 over the 960 markets of the default sweep (23, 20, 24, 23, 23, 23 for seeds 1
+  to 6, which have 24 markets each; the per-run counter is 24 in only 17 of the 40 runs and
+  11 to 24 across them), so it does not equal the number of markets, and it does not mean
+  900 directional bets.
+* The larger unhedged exit (default seed 3, `ETH-1700001900-900s`, 43.2 UP shares)†: flatten sells are IOC
   orders limited to the bid seen at the decision; in the last 25 seconds of a window the UP mid moves
   several ticks per second, and ten consecutive sells (at 876, 882, 888, 889, 893, 894, 895, 896, 897
   and 898 s) all missed because the bid at the next snapshot was lower than their limit; the window
   ended with the UP bid falling from 0.55 to 0.02 in the last three seconds. Across a default run,
   with a 1-snapshot latency the IOC completion buys fill 46% of their shares and the flatten sells
-  88% (seed 1; 42% and 62% at latency 2; 100% and 93% at latency 0). Verdict: latency
-  risk of IOC-at-the-touch, by design.
+  88% (seed 1; 42% and 62% at latency 2; 100% and 93% at latency 0)†.
+  Verdict: latency risk of IOC-at-the-touch, by design.
 
-### 6.8 Merges, rejections, hot loops (not found)
+### 6.8 Merges, rejections, hot loops (one open interplay at latency 3)
 
-* Merges failing: 0 in all 88 runs of this file and in the 450 random configurations
-  (`runner_stats.merge_failures`); 1 in the 48 corrupted-feed runs (seed 5, latency 3): a completion buy
-  (IOC) was still in flight when FLATTEN began, so the engine sized a flatten sell of the UP shares on the
-  pre-fill inventory; when the buy filled, the merge it then planned could not use the UP shares that the
-  in-flight sell had reserved and was refused (the shares were sold instead). It involves no cancel and is a
-  latency-3 interplay of two in-flight IOC orders in the engine, not an exchange error; not fixed here. Cancel misses
-  (the runner asking to cancel an order that was already gone): 0 everywhere, because an order whose cancel
-  is pending is not reported by `open_orders`.
-* Orders rejected: 0 of 1,884,246 orders in all 88 runs of this file, 0 in the 450 random configurations
-  (cash from 500 to 100,000, latency 0 to 3, tick 0.001 to 0.02, fees on and off, tiny caps and rate
-  limits) and 0 in 48 runs with a corrupted feed (3 windows of BTC and ETH, latency 0 to 3, with dropped
-  snapshots, missing, stale and future-stamped spot, empty, one-sided, zero-size and very wide books and enormous
-  prints). Cash-limited accounts rely on the exchange freeing the cash of an order whose cancel is
-  pending for the orders sent behind the cancel (DESIGN 5): 420 further random two-asset runs with cash from 60 to
-  1,500 USDC, latency 0 to 3, maker fees and rebates and 1 to 5 ladder levels also had no `insufficient_cash`.
-* Correction (later audit): the zero-rejection claim above did not hold for a positive
-  `fees.maker_fee_rate` combined with an account small enough for cash to bind (about 500 USDC or
-  less for two markets; for example `maker_fee_rate=0.001`, cash 300, seed 1, 4 windows gave 1,745
-  `insufficient_cash` rejections of 8,824 orders). The engine's belief of the other market's
+* Merges failing (`runner_stats.merge_failures`): 0 in all 88 runs of this file; 3 in
+  2 of the 450 random configurations† (all at latency 3, which 121 of the
+  450 configurations had); 1 in the 48 corrupted-feed runs† (seed 5, latency 3). The mechanism is the
+  same each time and was traced for the corrupted run: a completion buy (IOC) was still in flight when
+  FLATTEN began, so the engine sized a flatten sell of the UP shares on the pre-fill inventory; when the
+  buy filled, the merge it then planned could not use the UP shares that the in-flight sell had
+  reserved and was refused (the shares were sold instead). It involves no cancel and is a latency-3
+  interplay of two in-flight IOC orders in the engine, not an exchange error and not an accounting
+  error; not fixed here (section 8, item 12). Cancel misses (the runner asking to cancel an order that
+  was already gone): 0 in the 88 runs and 0 in the random sweep, because an order
+  whose cancel is pending is not reported by `open_orders`.
+* Orders rejected: 0 of 1,884,362 orders in all 88 runs of this file, 0 in the 450
+  random configurations† (cash from 500 to 100,000, latency 0 to 3, tick 0.001 to 0.02, fees on and off,
+  tiny caps and rate limits) and 0 in 48 runs with a corrupted feed† (3 windows of BTC and ETH,
+  latency 0 to 3, with dropped snapshots, missing, stale and future-stamped spot, empty, one-sided,
+  zero-size and very wide books and enormous prints). Cash-limited accounts rely on the exchange freeing
+  the cash of an order whose cancel is pending for the orders sent behind the cancel (DESIGN 5):
+  420 further random two-asset runs† with cash from 60 to 1,500 USDC, latency 0 to 3, maker fees and
+  rebates and 1 to 5 ladder levels had 0 `insufficient_cash` rejections.
+* Correction (earlier audit): a zero-rejection claim made before the engine reserved the maker fee did
+  not hold for a positive `fees.maker_fee_rate` combined with an account small enough for cash to bind
+  (about 500 USDC or less for two markets; for example `maker_fee_rate=0.001`, cash 300, seed 1, 4 windows
+  gave 1,745 `insufficient_cash` rejections of 8,824 orders, measured before the fix†). The engine's belief of the other market's
   reservation counted `price * remaining` but not the maker fee that the exchange also commits, so
   the later market's ladder was sized past the free cash and its last levels were refused every
   snapshot. Fixed in `strategy/engine.py` (the reservation of a resting bid now includes a positive
@@ -413,32 +468,35 @@ imbalance is not bounded by the caps, see 6.7.
   with cash that never binds (every run reported in this document: default, and the fee-heavy
   variant at 10,000 USDC), the change is a no-op: the fills of the six fee-heavy runs of section
   3.5 and of 24 further default, rebate, fee-with-ample-cash and zero-fee tight-cash runs were
-  byte-identical before and after that engine change (on the exchange as it was then; the figures of
-  this file also carry the later cancel-latency change of 6.12).
-* Post-only cancels: 944 of 27,504 orders (3.4%) in default seed 1. They are not a loop: 914 are
+  byte-identical before and after that engine change (measured then, on the exchange as it was then;
+  not re-measurable now).
+* Post-only cancels: 947 of 27,533 orders (3.4%) in default seed 1†. They are not a loop: 917 are
   isolated, 15 repeat once at the same price within two snapshots, and the longest run of
-  consecutive snapshots with a post-only cancel on one market and token is 4. They occur when the touch
-  moves through a resting bid during the 1-snapshot latency and are spread across the whole window.
+  consecutive snapshots with a post-only cancel on one market and token is 4. They occur when the
+  touch moves through a resting bid during the 1-snapshot latency and are spread across the whole window.
 
 ### 6.9 Cash reserved but unused, kill switch, determinism (no problem)
 
-* Capital use is small: reserved cash in resting bids averages 172 USDC (maximum 423) and positions
-  159 USDC (maximum 326) of 10,000 (default seed 1), about 3% of the account, because the clip is a fixed 100 shares
-  (`clip_equity_fraction` is unset). No capital cap ever binds (`risk_trips_capital` is 0 in all 88 runs).
-* Kill switch: 9 trips in 40 default seeds, 5 in 6 in the no-lag variant (genuine cumulative losses; a tripped run stops quoting,
-  keeps merging and flattening, and trades nothing afterwards). With instant cancels the default seeds never tripped it.
-* Determinism: two runs of the same command give byte-identical `result.json`; identical under
-  `PYTHONHASHSEED` 0, 1 and 12345 (also a test); `--no-invariants` and `--sample-every` change nothing
-  except what they name (the same fills, the same totals; the sampled drawdown moves with the sampling); the sim -> JSONL -> `replay` result equals the direct run
-  apart from its source label.
+* Capital use is small: reserved cash in resting bids averages 172 USDC (maximum 423) and
+  positions 159 USDC (maximum 326) of 10,000 (default seed 1)†, about 3% of the
+  account, because the clip is a fixed 100 shares (`clip_equity_fraction` is unset). No capital cap
+  ever binds (`risk_trips_capital` is 0 in all 88 runs).
+* Kill switch: 10 trips in 40 default seeds, 5 in 6 in the no-lag variant (genuine cumulative losses;
+  a tripped run stops quoting, keeps merging and flattening, and trades nothing afterwards). With instant
+  cancels the default seeds never tripped it (0 in 40†).
+* Determinism: two runs of the same command give byte-identical `result.json` (re-checked for default
+  seed 1: byte-identical); byte-identical under `PYTHONHASHSEED` 0, 1 and 12345 (also a test);
+  `--no-invariants` and `--sample-every` change nothing except what they name (the same fills, the same
+  totals; the sampled drawdown moves with the sampling); the sim -> JSONL -> `replay` result equals the
+  direct run apart from its source label (checked on default seed 1: same fills.csv, same result.json but for `source_label`).
 
 ### 6.10 Independent audits that agreed with the engine
 
-* Cash and PnL recomputed from `fills.csv` alone (buys, sells, the fee formula applied independently,
+* Cash and PnL recomputed from `fills.csv` alone† (buys, sells, the fee formula applied independently,
   merges at 1 USDC per pair, settlement at 1 USDC per winning share) match `total_pnl` to 1e-6 (largest
-  difference 7e-11, fee formula difference 0) on 18 runs spanning six variants.
+  difference 6e-11, fee formula difference 0) on 18 runs spanning six variants.
 * Report metrics (Brier, max drawdown, pair completion, average notional) recomputed from the raw
-  result match (largest difference 6e-14) on the same 18 runs.
+  result† match (largest difference 6e-14) on the same 18 runs.
 * Every fill checked against the feed that produced it (now a test, `tests/test_integration.py`):
   maker fills need a print of that token at or through the fill price in the same snapshot and an
   order that was live for one snapshot before; taker fills need a displayed level with enough size.
@@ -457,13 +515,13 @@ imbalance is not bounded by the caps, see 6.7.
 With all feature weights set to zero the model's Brier score equals the market mid's to within about
 0.005 at every horizon, so the units, the volatility and the time-to-expiry handling are consistent with
 the simulator (96 markets, 48 windows of BTC and ETH, at 100, 300, 500, 700 and 800 s into the
-window: 0.2513, 0.2115, 0.1795, 0.0959, 0.0613 for the model against 0.2504, 0.2167, 0.1812, 0.0948,
-0.0624 for the market). The uncalibrated feature weights make the raw model slightly worse at four
-of those five horizons (for example 0.2665 at 100 s), partly because the depth imbalance feature is
-noise on a simulator whose displayed depth carries no information (and, because the DOWN book is
-the exact mirror of the UP book, `up imbalance - down imbalance` is just twice the UP imbalance).
-Over 40 default seeds the engine's Brier score is 0.0731 against 0.0728 for the market.
-Skill against the market is therefore indistinguishable from zero here. Mechanics only.
+window: 0.2513, 0.2115, 0.1795, 0.0959, 0.0613 for the model against 0.2504, 0.2167, 0.1812, 0.0948, 0.0624 for the market)†. The uncalibrated feature weights make
+the raw model slightly worse than the zero-weight model at four of those five horizons (for example 0.2665 at
+100 s), partly because the depth imbalance feature is noise on a simulator whose displayed depth
+carries no information (and, because the DOWN book is the exact mirror of the UP book, `up imbalance -
+down imbalance` is just twice the UP imbalance). Over 40 default seeds the engine's Brier score is
+0.0731 against 0.0728 for the market. Skill against the market is therefore indistinguishable
+from zero here. Mechanics only.
 
 ### 6.12 Cancels took no time (found by a later review; fixed)
 
@@ -487,32 +545,36 @@ Skill against the market is therefore indistinguishable from zero here. Mechanic
   reach the venue after the cancel), and a fill of the pending order is capped to what the funds left
   by the other orders can pay for, so a cash-limited account can still replace its ladder in one
   snapshot and cash and positions stay non-negative. At latency 0 a cancel is instant, as before.
-* Size of the effect. The "instant cancels" columns below were re-measured with the exchange as it was before
-  this fix (and before 6.13, which changes none of these runs: checked on seeds 1 to 3 at latency 0, 1 and 2),
-  and the others with the current one, so the difference is the cancel latency alone. The instant-cancel figures
-  are the ones the first version of this file printed:
+* Size of the effect†. The "instant cancels" columns below come from a scratch variant of the current
+  exchange whose `cancel()` removes the order at once at any latency (the first version's model; the
+  engine is the current one), the other columns from the current exchange, so the difference is the
+  cancel latency alone. At latency 0 the two are the same exchange: the fill digests of seeds 1 to 3 are
+  all three identical.
 
 | `exchange.latency_ticks` (seeds 1-3) | Fills, instant cancels | PnL mean, instant cancels | Fills, cancels take the latency | PnL mean, cancels take the latency |
 |---:|---:|---:|---:|---:|
-| 0 | 1340 | +187 | 1340 | +187 |
-| 1 (default) | 514 | -39 | 962 | -216 |
-| 2 | 227 | -91 | 1194 | -815 |
-| 3 | 117 | -9 | 1198 | -772 |
+| 0 | 1342 | +197 | 1342 | +197 |
+| 1 (default) | 516 | -22 | 968 | -240 |
+| 2 | 225 | -125 | 1204 | -670 |
+| 3 | 117 | -9 | 1199 | -771 |
 
-  Default configuration, seeds 1 to 6, PnL (USDC): -76, -168, +126, +48, -256, -304 with instant cancels
-  (mean -105.1, kill switch tripped 0 times) against +339, -745, -243, -500, -726, -895 (mean -461.7, tripped
-  1 time). Over the 40 seeds the mean goes from -120.0 (s.e. 38.8, positive in
-  15, no trips) to -538.5 (s.e. 62.5, positive in 2, 9 trips): the paired difference per seed is
-  -418.5 USDC (s.e. 56.2), worse in 36 of 40 seeds, and fills per run go from 498 to 920.
-  805 of the 1,110 maker fills of default seed 1 (72.5%) are on orders the engine had already cancelled.
+  Default configuration, seeds 1 to 6, PnL (USDC): -66, -168, +167, +20, -256, -304 with instant cancels (mean -101.1, kill switch
+  tripped 0 times) against +360, -745, -335, -473, -726, -895 (mean -469.1, tripped 1 time). Over the 40 seeds the mean goes from
+  -118.2 (s.e. 38.4, positive in 15, no trips) to -535.9 (s.e. 62.0, positive in 2,
+  10 trips): the paired difference per seed is -417.7 USDC (s.e. 55.2), worse in 36 of 40
+  seeds, and fills per run go from 499 to 920. 810 of the 1,114 maker fills of default
+  seed 1 (72.7%) are on orders the engine had already cancelled. (The first version of this file, run on
+  the earlier engine and exchange of commit `d6b60fa`, printed 1,340 / 514 / 227 / 117 fills and +187 / -39 /
+  -91 / -9 USDC for latency 0 to 3 and a 40-seed mean of -120.0 USDC (s.e. 38.8, positive in 15, no trips); the
+  instant-cancel columns above reproduce those figures closely.)
 * What no longer holds from the first version of this file: that an order re-priced at `t+1` never had a chance
   and that only about 20% of the orders live long enough to be matchable (6.1); that fills fall by a
-  factor of 11 from latency 0 to 3 (section 4 and the README; now 1,340 / 962 / 1,194 / 1,198); that the
-  kill switch never trips in the default seeds (section 2, 6.9); that net imbalance respects its caps (6.7); and the
-  headline PnL of every table, which is lower in 36 of the 40 default seeds. What holds unchanged: the latency-0 row (an instant
-  cancel is correct at latency 0; 1,340 fills and +187 in both columns), the Brier columns (they do not depend on fills),
-  the conclusion that the default strategy loses on this simulator (now by more), and every accounting
-  invariant.
+  factor of 11 from latency 0 to 3 (section 4 and the README; now 1,342 / 968 / 1,204 /
+  1,199); that the kill switch never trips in the default seeds (section 2, 6.9); that net imbalance
+  respects its caps (6.7); and the headline PnL of every table, which is lower in 36 of the 40 default
+  seeds. What holds unchanged: the latency-0 row (an instant cancel is correct at latency 0; the same fills in
+  both columns), the Brier columns (they do not depend on fills), the conclusion that the default strategy
+  loses on this simulator (now by more), and every accounting invariant.
 * Tests (`tests/test_paper_exchange.py`, "cancel latency" section, `tests/test_integration.py` and `tests/test_backtest_e2e.py`): the finding's
   scenario (a through-print after the cancel was sent still fills); a cancel landing after exactly
   1, 2 and 3 snapshots; funds, fees, positions and caps; second cancel refused; too late (filled, IOC,
@@ -532,10 +594,11 @@ Skill against the market is therefore indistinguishable from zero here. Mechanic
   mirrored ask.
 * Fix (`exchange/paper.py::_pool`): depth is keyed by UP-book coordinates, `(takes the UP ask, UP price)`; a SELL of
   DOWN at `b` maps to the UP ask at `1 - b`, a BUY of DOWN at `a` to the UP bid at `1 - a`.
-* Effect on this file: none. The engine never submits both IOC legs of a mirrored pair in one snapshot
-  (completion buys and flatten sells are one order per market per snapshot, and run in different phases); the fill
-  digests of seeds 1 to 3 at latency 0, 1 and 2 are identical with the old and the new key. It was a latent flaw of
-  the exchange, relevant to any strategy that takes both legs in one snapshot.
+* Effect on this file: none†. The engine never submits both IOC legs of a mirrored pair in one snapshot
+  (completion buys and flatten sells are one order per market per snapshot, and run in different phases); with the
+  old per-token key restored in a scratch run, the fill digests of seeds 1 to 3 at latency 0, 1 and 2 are the same
+  as the stored ones (9 of 9). It was a latent flaw of the exchange, relevant to any strategy
+  that takes both legs in one snapshot.
 * Tests: six tests in `tests/test_paper_exchange.py` (both mirrored pairs, either order, the remainder of a
   partly used pool, independence of the other side and other levels, two in-flight IOCs activating together).
 
@@ -579,13 +642,14 @@ Skill against the market is therefore indistinguishable from zero here. Mechanic
   with a 60 USDC budget and 150 shares held, the bids were UP 128.3 / DOWN 0 shares when UP was heavy and
   UP 122.9 / DOWN 0 when DOWN was heavy (the completing token starved in the first). On a 300 USDC account the same run
   with the labels swapped (books, prints, winner mirrored, spot mapped to `C^2/spot`) gave -197.6 / -224.4 / -272.2 /
-  +52.2 USDC (seeds 1 to 4, 3 windows) against +27.9 / -225.8 / +9.4 / -148.7.
+  +52.2 USDC (seeds 1 to 4, 3 windows) against +27.9 / -225.8 / +9.4 / -148.7 (measured by the reviewer's script
+  on the code before the fix†).
 * How much it matters: nothing at the documented operating point. The account is 10,000 USDC and about 3% of it is
-  used (6.9), so the budget does not bind; with the rate limiter lifted the fills of default seeds 1 to 4 are
-  byte-identical before and after (same `fills_sha256`). It bites on a small account with the fixed 100-share clip:
+  used (6.9), so the budget does not bind; with the rate limiter lifted the fills of default seeds 1 to 4 were
+  byte-identical before and after (same `fills_sha256`)†. It bites on a small account with the fixed 100-share clip:
   over seeds 1 to 6 (4 windows, limiter lifted) the pair completion rate was 43.6% -> 66.2% at 150 USDC, 68.7% -> 82.6%
   at 300 USDC and 90.8% -> 92.2% at 600 USDC (mean PnL -27.2 -> -34.2, -182.5 -> -154.3, -150.9 -> -146.8: noise, six
-  seeds of an uncalibrated simulator say nothing about profit).
+  seeds of an uncalibrated simulator say nothing about profit)†.
 * Fix (`strategy/quoter.py::compute_quotes`, `strategy/engine.py::_place_quotes`): the budget is handed out in
   priority order, not label order. (1) A token that completes pairs is funded first, all its levels (it reduces risk and
   locks the pair profit). (2) The other tokens are funded level by level, every token's level 0 before any level 1, and
@@ -597,15 +661,15 @@ Skill against the market is therefore indistinguishable from zero here. Mechanic
   already rested), then UP before DOWN on an exact tie. DESIGN 2.2(4) and 2.8 say so.
 * Label symmetry afterwards: the reviewer's script gives bit-identical PnL for the original and the label-swapped market
   on the unconstrained account, on the default config (seeds 3 and 9) and on 300 USDC (-260.8 / -195.0 / -11.7 / +9.2,
-  seeds 1 to 4). The mirror states of the quoter give mirror quotes for every budget tested (tests below). The one exact
+  seeds 1 to 4)†. The mirror states of the quoter give mirror quotes for every budget tested (tests below). The one exact
   tie that remains is the exchange-side order of two orders of the same snapshot (UP is emitted first); it did not
   change a single result in these runs.
 * Effect on this file: none from the cash budget (see above). The rate-limit rank changes which placements are dropped
   where the limiter bites, so a default run that drops placements follows a different path: with the CLI (`backtest
-  --seed S --windows 12`) seeds 1, 3 and 4 give +359.90, -335.42 and -472.82 USDC (they were +338.98, -242.88 and -499.95),
-  seeds 2, 5 and 6 are identical, the six-seed mean moves from -461.7 to -469.1 (no systematic direction: the standard
-  error is 185). The tables of sections 2 to 5 and the 40-seed figures were generated before this change and have not
-  been regenerated.
+  --seed S --windows 12`) seeds 1, 3 and 4 give +359.90, -335.42 and -472.82 USDC (before the change they were +338.98,
+  -242.88 and -499.95†), seeds 2, 5 and 6 are identical, and the six-seed mean moves from -461.7 to -469.1 (no systematic
+  direction: the standard error is 185). The tables of sections 2 to 5 were regenerated after this change and carry the new
+  figures.
 * Tests: `tests/test_strategy_quoter.py` (flat budget split evenly, completing token first and its mirror, max-min fair
   split, no tie-break when the budget cannot rest both sides, 144 parametrised mirror states and an 800-state random
   mirror-symmetry property with a binding budget), `tests/test_strategy_engine.py` (rate limiter: completing token
@@ -621,7 +685,7 @@ Skill against the market is therefore indistinguishable from zero here. Mechanic
 
 | Change | File | Why | Test |
 |---|---|---|---|
-| `PaperExchange._check_invariants` now makes one pass over the open orders and builds its failure message only on failure; `_validate_book` and `_validate_trade` do the same | `src/abc_trading/exchange/paper.py` | profiling showed the self-check was the largest single cost (about 19% of a run): it made five passes over the orders and built several `repr`-heavy f-strings per order on every call. A BTC day went from 29.4 s to about 23 s. Behaviour is identical (36 runs compared before and after: identical `result.json`) | `tests/test_integration.py::test_the_exchange_asserts_its_own_invariants` (new; the five assertion paths of the self-check had no test before) and the whole of `tests/test_paper_exchange.py` |
+| `PaperExchange._check_invariants` now makes one pass over the open orders and builds its failure message only on failure; `_validate_book` and `_validate_trade` do the same | `src/abc_trading/exchange/paper.py` | profiling showed the self-check was the largest single cost (about 19% of a run): it made five passes over the orders and built several `repr`-heavy f-strings per order on every call. A BTC day went from 29.4 s to about 23 s (a first-pass measurement of code that was never committed, so it cannot be reproduced now). Behaviour is identical (36 runs compared before and after: identical `result.json`) | `tests/test_integration.py::test_the_exchange_asserts_its_own_invariants` (new; the five assertion paths of the self-check had no test before) and the whole of `tests/test_paper_exchange.py` |
 | New whole-system tests | `tests/test_integration.py` | invariants of DESIGN section 7 that only exist once the modules are connected: 7.7 to 7.9 on real runs including kill-switch and stale-spot runs, fill legitimacy against the feed, no look-ahead (with a negative control), hash-seed determinism | 21 new tests, about 3.4 s |
 | Cancels take `latency_ticks` like orders; a cancelled order stays matchable until its cancel lands, is hidden from `open_orders` and frees its funds for later orders; `pending_cancels()`, `cancel_too_late` | `src/abc_trading/exchange/paper.py`, `exchange/base.py` | the first version let a cancel take effect at once, which flattered fills and PnL (6.12) | `tests/test_paper_exchange.py` (cancel latency section), `tests/test_integration.py::test_a_cancelled_order_can_fill_only_until_its_cancel_lands` and `tests/test_backtest_e2e.py::test_cash_limited_runs_with_slow_cancels_are_never_refused_for_cash` (new) |
 | IOC depth is shared by the mirrored UP and DOWN books | `src/abc_trading/exchange/paper.py` | the two books are one liquidity pool (DESIGN 1); depth was consumed per token (6.13) | six tests in `tests/test_paper_exchange.py` (new) |
@@ -636,20 +700,24 @@ default parameter. The later changes recorded in this file are: the engine's res
 the contract written into DESIGN 4.4 and 5, a docstring note in `strategy/engine.py`, the comment of
 `exchange.latency_ticks` in `config.py` and `configs/default.toml`, and the caveat text of the report
 (`backtest/report.py`); the mirrored IOC depth (6.13) in `exchange/paper.py`; the report and CLI wording (6.14),
-which added two fields to `PnLStats` (`n_markets_resolved_traded`, `pnl_unrealised`); and the priority of a scarce
+which added two fields to `PnLStats` (`n_markets_resolved_traded`, `pnl_unrealised`); the priority of a scarce
 cash budget and of the rate-limit quota (6.15) in `strategy/quoter.py` and `strategy/engine.py`, with DESIGN 2.2(4) and
-2.8; and the asymmetry audit above, which changed tests only and added one test convention to DESIGN 8 and the README.
-None of them changed a default parameter.
+2.8; the settled-market index of `Portfolio` (section 5, DESIGN 4.1); and the asymmetry audit above, which changed
+tests only and added one test convention to DESIGN 8 and the README. None of them changed a default parameter.
+Other review fixes (strict typing of TOML values and a single validation gate in `config.py`, the hardening of
+the data clients in `data/public_api.py` and `data/live.py`, the `warning:` for a kill switch that can never fire,
+and the comments on `requote_tolerance_ticks` and `taker_slippage_ticks`) move no figure in this file: every run
+above was made with the code that contains them.
 
 ## 8. Known limitations and open issues (not fixed)
 
-1. **Quote churn.** 79% of orders are cancelled one snapshot after placement and, because a cancel takes as long
-   as an order, stay hittable meanwhile (72.5% of the maker fills come from such orders), so fills and PnL depend on the
-   latency and queue assumptions more than on the strategy (sections 6.1, 6.12). A tolerance or a
-   discretionary-requote rule is a strategy decision, not an integration fix.
-2. **The default strategy loses on this simulator** (mean -538.5 USDC per 12-window run over
-   40 seeds, positive in 2, kill switch tripped in 9), because the unpaired inventory it must dump costs more than the
-   pair margin earns (section 6.2). Whether that carries over to real markets is unknown.
+1. **Quote churn.** 79.3% of the orders are cancelled one snapshot after placement and, because a cancel takes as long
+   as an order, stay hittable meanwhile (72.7% of the maker fills come from such orders), so fills and PnL
+   depend on the latency and queue assumptions more than on the strategy (sections 6.1, 6.12). A tolerance
+   (one-sided, section 4) or a discretionary-requote rule is a strategy decision, not an integration fix.
+2. **The default strategy loses on this simulator** (mean -535.9 USDC per 12-window run over
+   40 seeds, positive in 2, kill switch tripped in 10), because the unpaired inventory it must dump costs more
+   than the pair margin earns (section 6.2). Whether that carries over to real markets is unknown.
 3. **Average-cost accounting** can attribute a negative margin to a merge (section 6.3) because it pools
    paired and unpaired shares; totals are exact.
 4. **IOC at the stale touch** is unreliable under latency in the last seconds of a window (section 6.7).
@@ -658,9 +726,11 @@ None of them changed a default parameter.
    and field names in `data/public_api.py` are unverified guesses (the sandbox cannot reach the
    hosts: `paper` exits with status 4 and a clear message). The slug template, the price-to-beat
    rule and the winner inference in `data/live.py` are approximations of the real venue.
-7. **Packaging.** `python3 -m abc_trading` needs `PYTHONPATH=src` or an editable install; `pip install -e .` works
-   in a virtual environment (checked) but `pip wheel .` fails in this sandbox because of the
-   distribution's patched setuptools, which is unrelated to the project.
+7. **Packaging.** `python3 -m abc_trading` needs `PYTHONPATH=src` or an editable install. In clean virtual
+   environments† `pip install -e .`, `pip wheel . --no-deps` and installing the wheel it builds all work (the
+   `abc-trading` command then runs; `README.md`, which `pyproject.toml` names, exists). The wheel holds only the
+   `abc_trading` package: `configs/default.toml` and `docs/` stay in the checkout, so `--config
+   configs/default.toml` needs the repository or a copy of that file.
 8. In the synthetic feed every print carries its snapshot's timestamp, so the exchange's
    `trade.ts >= live_ts` guard (a print older than the order's go-live moment must not fill it) is
    never exercised end to end; it is covered by two unit tests in `tests/test_paper_exchange.py`
@@ -670,14 +740,21 @@ None of them changed a default parameter.
    multi-day backtest is therefore judged against one `max_daily_loss_usd` for the whole run, and
    the report's drawdown (marked at market mids) can differ from the equity the switch sees.
 10. **Caps are soft.** The inventory, net-imbalance and capital caps bound what the engine rests; an order it has
-    cancelled can still fill until the cancel lands, so they can be exceeded (6.7: net imbalance up to 584 shares).
+    cancelled can still fill until the cancel lands, so they can be exceeded (6.7: net imbalance up to 583.5 shares).
 11. **The cancel model is still an assumption.** A cancel can only fail by losing a race to a fill (there are no
     cancel rejections, reorderings or acknowledgement delays), and on a cash- or position-limited account a fill
     of an order with a pending cancel is capped in favour of its replacement (DESIGN 5); with ample cash that
     never binds.
 12. **Two in-flight IOC orders can conflict at latency 3** (6.8): a flatten sell sized before a completion buy
-    filled can reserve the shares of the merge planned right after. Seen once in 48 corrupted-feed runs, never in
-    the 88 uncorrupted runs; not fixed.
+    filled can reserve the shares of the merge planned right after, and the merge is refused (the shares are
+    sold instead). Seen once in 48 corrupted-feed runs and 3 times in 2 of 450 random
+    configurations†, always at latency 3, never in the 88 uncorrupted runs of this file; not fixed.
+13. **`exchange.taker_slippage_ticks` is capped at the order's limit**, and the engine limits its IOC orders
+    at the touch it saw, so at latency 0 the setting changes nothing for the engine's own orders (K = 0, 1
+    and 5 ticks give identical fills: 1,560 fills, +603.20 USDC, one `fills_sha256`), and at latency 1 it can only move a fill from the fresh level
+    to the stale limit, after which the run follows a different path (default seed 1: +359.90, +234.75, +72.58 USDC for 0, 1 and 5 ticks). To stress
+    taker costs, raise the fee parameters (the fee-heavy variant of 3.5) rather than this knob (DESIGN 5, README
+    configuration table).
 
 ## 9. How to reproduce
 
@@ -686,25 +763,42 @@ From the repository root (the package is not installed, so put `src` on the path
 
 ```
 export PYTHONPATH=src
-python3 -m abc_trading backtest --seed S --windows 12                                   # default, S = 1..6
-python3 -m abc_trading backtest --seed S --windows 12 --assets BTC                      # 3.1
-python3 -m abc_trading backtest --seed S --windows 12 --set sim.informed_flow=0         # 3.2
-python3 -m abc_trading backtest --seed S --windows 12 --set sim.market_lag_seconds=0    # 3.3
-python3 -m abc_trading backtest --seed S --windows 12 --set directional.enabled=false   # 3.4
+python3 -m abc_trading backtest --seed S --windows 12                                   # default, S = 1..40 (sections 2, 4, 6)
+python3 -m abc_trading backtest --seed S --windows 12 --assets BTC                      # 3.1, S = 1..6
+python3 -m abc_trading backtest --seed S --windows 12 --set sim.informed_flow=0         # 3.2, S = 1..6
+python3 -m abc_trading backtest --seed S --windows 12 --set sim.market_lag_seconds=0    # 3.3, S = 1..6
+python3 -m abc_trading backtest --seed S --windows 12 --set directional.enabled=false   # 3.4, S = 1..6
 python3 -m abc_trading backtest --seed S --windows 12 \
-    --set fees.taker_fee_rate=1.0 --set fees.maker_fee_rate=0.01                        # 3.5
-python3 -m abc_trading backtest --seed S --windows 96 --assets BTC                      # section 5
+    --set fees.taker_fee_rate=1.0 --set fees.maker_fee_rate=0.01                        # 3.5, S = 1..6
+python3 -m abc_trading backtest --seed S --windows 12 --set exchange.latency_ticks=L    # section 4, L = 0, 2, 3, S = 1..3
+python3 -m abc_trading backtest --seed S --windows 12 --set sizing.requote_tolerance_ticks=T   # section 4, T = 1, 2, S = 1..3
+python3 -m abc_trading backtest --seed S --windows 36 --set sim.window_seconds=300      # section 4, S = 1..3
+python3 -m abc_trading backtest --seed S --windows 96 --assets BTC                      # section 5, S = 1..3
+python3 -m abc_trading backtest --seed 1 --windows 96                                   # section 5, BTC and ETH
 python3 -m abc_trading backtest --seed S --windows 96 --assets BTC \
-    --set risk.max_daily_loss_usd=1e12                                                   # section 5, whole day traded
-python3 -m abc_trading backtest --seed S --windows 36 --set sim.window_seconds=300      # section 4
+    --set risk.max_daily_loss_usd=1e12                                                   # section 5, whole day traded, S = 1..3
+python3 -m abc_trading backtest --seed 1 --windows 96 --set risk.max_daily_loss_usd=1e12   # section 5, BTC and ETH, whole day traded
+python3 -m abc_trading backtest --seed 1 --windows W --assets BTC --no-invariants \
+    --set risk.max_daily_loss_usd=1e12                                                   # section 5 scaling table, W = 12, 48, 96, 192
+python3 -m abc_trading backtest --seed 1 --windows 12 --sample-every 1                  # event-granular drawdown (section 1)
+python3 -m abc_trading backtest --seed 1 --windows 12 --set exchange.latency_ticks=L \
+    --set exchange.taker_slippage_ticks=K                                                # section 8 item 13, L = 0, 1, K = 0, 1, 5
+python3 -m abc_trading record --seed 1 --windows 12 --out feed.jsonl
+python3 -m abc_trading replay feed.jsonl --out DIR                                      # 6.9: equals the direct run but for the label
 ```
 
 Add `--out DIR` to write `result.json`, `config.json`, `fills.csv`, `markets.csv` and `equity.csv`.
-`python3 -m pytest` runs the tests (about 30 s); `ruff check .`, `ruff format --check .` and
+`python3 -m pytest` runs the tests (about 35 s); `ruff check .`, `ruff format --check .` and
 `mypy src` must stay clean.
 
-The tables above were generated from the `result.json` files of these runs by a small script
-(not part of the repository), so that no number was typed by hand. The exploratory scripts used for
-section 6 (order-lifecycle statistics, markouts, flatten decomposition, the random-configuration and
-corrupted-feed sweeps, the independent PnL audit) were scratch tools; their durable parts are the tests in
-`tests/test_integration.py`.
+What those commands do and do not reproduce. Every table of sections 2 to 5 and every figure of section 6
+without a dagger is a function of the files `--out` writes, and was copied from them by a script that is not
+part of the repository. The figures marked † are not: they came from scratch scripts (a tracing subclass of
+`PaperExchange` that records each order's life, the markout, flatten-decomposition and feed statistics, the
+independent recomputation of cash and metrics from `fills.csv`, the Brier-by-horizon script, the
+counterfactual exchanges of 6.12 and 6.13, the random-configuration and corrupted-feed sweeps, the cash-limited
+stress runs, the timing drivers, the packaging check) that were written for this pass and live outside the
+repository. Their durable parts are the tests (`tests/test_integration.py` and the exchange, engine and report
+tests named in sections 6.12 to 6.15), which check the same properties on smaller runs. Figures that the text attributes to the first version of this
+file come from `git show d6b60fa:docs/RESULTS.md`; those attributed to an earlier audit or to the state of the code
+before a fix were measured then and cannot be re-measured on the current tree.

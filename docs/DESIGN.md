@@ -420,8 +420,11 @@ class PaperExchange:           # implements Exchange; also:
   fell by k ticks since last tick, SELL prints on UP at each consumed old bid level (and the
   mirrored BUY prints on DOWN); symmetric for ask rises; scaled/gated by `informed_flow`
   (this creates adverse selection: fills happen right before price moves against you).
-  *Uninformed flow* — Poisson(`uninformed_trades_per_sec * tick_seconds`) touch prints per token
-  side with random sizes. Snapshots carry the prints since the previous snapshot.
+  *Uninformed flow* — Poisson(`uninformed_trades_per_sec * tick_seconds`) arrivals per market and
+  tick, each at the touch of a uniformly random token and side with a random size (lognormal, mean
+  30 shares), printed together with its mirror on the other book (so each of the four token-side
+  streams sees `uninformed_trades_per_sec / 2` prints per second). Snapshots carry the prints since
+  the previous snapshot.
 * Events are emitted in non-decreasing `ts`; snapshots for `ts ∈ [start, end)`; a
   `MarketResolved` at `end_ts` after the last snapshot. Fully deterministic for a given seed
   (use a private `random.Random(seed)`; no global RNG, no wall clock).

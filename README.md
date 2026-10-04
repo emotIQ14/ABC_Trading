@@ -79,7 +79,7 @@ repository does not reproduce or confirm the claim: doing so would need real fil
 does not have. The only place the $53 appears in code is a label in the report that prints the
 simulated average trade next to it for comparison. The default clip (100 shares, about $50 at 50c)
 is of a similar order, but no parameter was tuned to hit the figure, and the simulated average
-trade is roughly 37 USDC.
+trade is roughly 35 USDC.
 
 ---
 
@@ -153,8 +153,8 @@ The margin is one cent per pair. Everything that follows is about how easily tha
   it, that is, just before it becomes a bad price. The leg that fills tends to be the one the
   market is leaving, and the opposite bid is now further from the market and may never fill. The
   synthetic simulator builds this in on purpose (informed sweeps), and the result is visible in
-  the sample run: merges earned +1,723.26 USDC while selling the unpaired remainder at the end of
-  windows lost -1,385.95 USDC.
+  the sample run: merges earned +1,719.66 USDC while selling the unpaired remainder at the end of
+  windows lost -1,361.51 USDC.
 * **Fees.** Completing the missing leg by crossing the spread costs the *ask*, not the bid, and
   pays the taker fee on top. In the example above the DOWN book mirrors the UP book, so once the
   UP bid has filled at 0.47 the DOWN ask is 0.53: buying DOWN there makes the pair cost
@@ -199,7 +199,7 @@ pip install -e '.[dev]'
 python3 -m pytest
 ```
 
-At the time of writing this collects 2,076 tests and takes about 30 seconds. Everything runs
+At the time of writing this collects 2,076 tests and takes about 35 seconds. Everything runs
 offline.
 
 ### 3. Run a backtest
@@ -229,24 +229,24 @@ Run
 Result
 ------
   Initial cash  10,000.00
-  Final equity  10,338.98
-  Total PnL     +338.98  (+3.39%)
-  Max drawdown  440.56  (4.27% of peak; sampled every 60 events)
+  Final equity  10,359.90
+  Total PnL     +359.90  (+3.60%)
+  Max drawdown  431.49  (4.17% of peak; sampled every 60 events)
   Kill switch   not tripped
 
 Per-market PnL
 --------------
   Markets resolved                   24 of 24 (24 traded)
-  Mean / std per market              +14.12 / 98.37
-  Sharpe-like (mean/std*sqrt(n))     +0.70
-  Best / worst market                +177.38 / -175.95
+  Mean / std per market              +15.00 / 97.91
+  Sharpe-like (mean/std*sqrt(n))     +0.75
+  Best / worst market                +167.18 / -175.95
   Win rate (traded markets)          50.0%
-  PnL from merges                    +1,723.26
-  PnL from sells (flatten)           -1,385.95
-  PnL at settlement, pairs           +0.79
+  PnL from merges                    +1,719.66
+  PnL from sells (flatten)           -1,361.51
+  PnL at settlement, pairs           +0.87
   PnL at settlement, directional     +0.88
   Unrealised, open inventory at mid  +0.00
-  Fees paid (inside the above)       135.30
+  Fees paid (inside the above)       136.77
 ...
 ```
 
@@ -450,14 +450,14 @@ table lists the knobs that matter most; `python3 -m abc_trading config` prints a
 | `exchange.latency_ticks` | 1 | Snapshots before a new order can fill, and before a cancel takes effect. |
 | `exchange.queue_ahead_fraction` | 1.0 | Share of the displayed size at our price assumed to be ahead of us. |
 | `exchange.trade_fill_fraction` | 1.0 | Share of a print assumed available to us after the queue. |
-| `exchange.taker_slippage_ticks` | 0 | Ticks an IOC fill is moved against us from the displayed level, **never beyond the order's limit**. The engine limits its IOC orders at the touch it saw, so at latency 0 this changes nothing; at latency 1 or more it only moves a fill from the fresh level up to the stale limit. |
+| `exchange.taker_slippage_ticks` | 0 | Ticks an IOC fill is moved against us from the displayed level, **never beyond the order's limit**. The engine limits its IOC orders at the touch it saw, so at latency 0 this changes nothing; at latency 1 or more it can only move a fill from the fresh level toward the stale limit. |
 | `exchange.enforce_min_order_size` | true | Reject orders below the market's minimum size. |
 | `sim.seed` | 1 | RNG seed. Same seed and config give an identical feed. |
 | `sim.assets` | `["BTC", "ETH"]` | Underlyings to simulate. |
 | `sim.window_seconds` / `sim.n_windows` | 900 / 8 | Window length and windows per asset. |
 | `sim.market_lag_seconds` | 2.0 | The simulated market prices off a spot this many seconds stale. **This is what gives the model something to find.** |
 | `sim.informed_flow` | 1.0 | 0 disables the sweeps that follow price moves, which removes adverse selection. |
-| `sim.uninformed_trades_per_sec` | 0.3 | Random touch prints per second per token side. |
+| `sim.uninformed_trades_per_sec` | 0.3 | Random touch trades per second per market, each shown on both mirrored books (so about 0.15 prints per second on each token side). |
 | `sim.pricing_noise_ticks` | 0.7 | AR(1) noise on the market's UP mid, in ticks. |
 | `sim.tick_size` / `sim.min_order_size` | 0.01 / 5.0 | Price increment and minimum order size (shares). |
 | `sim.spot0`, `sim.annual_vol`, `sim.mean_spread_ticks`, `sim.depth_mean_shares`, `sim.n_levels`, `sim.market_vol_multiplier`, `sim.tick_seconds` | see `configs/default.toml` | Remaining feed parameters. |
@@ -604,8 +604,8 @@ live, so 400 are ahead of it). These are the numbers `PaperExchange` actually pr
 
 **Why it matters, and the caveat.** Fills in a backtest depend heavily on these assumptions. In
 the three-seed latency sweep below, going from 0 to 1 snapshot of latency turns a mean PnL of
-+187 USDC into -216 USDC, and in the default seed-1 run 79% of the post-only orders were cancelled
-by the engine one snapshot after they were placed while 72% of the maker fills came from orders
++197 USDC into -240 USDC, and in the default seed-1 run 79% of the post-only orders were cancelled
+by the engine one snapshot after they were placed while 73% of the maker fills came from orders
 the engine had already cancelled (their cancel had not landed yet). "Pessimistic" is a design
 intent, not a validated property: the model has never been compared with real queues or cancel
 acknowledgements, and it can still be optimistic in ways it does not model (it assumes the
@@ -636,32 +636,32 @@ python3 -m abc_trading backtest --seed S --windows 12      # S = 1..6
 
 | Seed | Windows | Assets | Fills | Avg trade (USDC) | Pair completion | PnL (USDC) | Max drawdown (USDC) | Brier model | Brier market | Kill switch |
 |---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| 1 | 12 x 900 s | BTC,ETH | 1255 | 36.01 | 95.7% | +338.98 | 440.6 | 0.1211 | 0.1111 | no |
+| 1 | 12 x 900 s | BTC,ETH | 1260 | 35.91 | 95.7% | +359.90 | 431.5 | 0.1211 | 0.1111 | no |
 | 2 | 12 x 900 s | BTC,ETH | 665 | 35.30 | 90.7% | -744.96 | 1070.6 | 0.0931 | 0.0949 | TRIPPED |
-| 3 | 12 x 900 s | BTC,ETH | 965 | 33.96 | 93.8% | -242.88 | 551.9 | 0.1043 | 0.1005 | no |
-| 4 | 12 x 900 s | BTC,ETH | 942 | 34.68 | 93.7% | -499.95 | 753.7 | 0.0739 | 0.0706 | no |
+| 3 | 12 x 900 s | BTC,ETH | 980 | 33.92 | 93.8% | -335.42 | 551.9 | 0.1043 | 0.1005 | no |
+| 4 | 12 x 900 s | BTC,ETH | 947 | 34.63 | 93.6% | -472.82 | 726.6 | 0.0739 | 0.0706 | no |
 | 5 | 12 x 900 s | BTC,ETH | 821 | 34.54 | 91.9% | -726.44 | 969.9 | 0.0131 | 0.0118 | no |
 | 6 | 12 x 900 s | BTC,ETH | 807 | 35.69 | 91.7% | -894.99 | 1034.5 | 0.0209 | 0.0239 | no |
-| **mean** | | | 909 | 35.03 | 92.9% | **-461.71** (s.e. 185) | 803.5 | 0.0711 | 0.0688 | 1 of 6 |
+| **mean** | | | 913 | 35.00 | 92.9% | **-469.12** (s.e. 185) | 797.5 | 0.0711 | 0.0688 | 1 of 6 |
 
 How the PnL arises (same runs, all fully resolved so nothing is unrealised; merge, flatten-sell and
 settlement PnL add up to the total, fees are already inside them):
 
 | Seed | Merge PnL | Flatten-sell PnL | Settlement PnL (pair + directional) | Fees paid (inside) | Total PnL |
 |---:|---:|---:|---:|---:|---:|
-| 1 | +1723.3 | -1386.0 | +1.7 | 135.3 | +339.0 |
-| 2 | +738.5 | -1482.6 | -0.8 | 82.7 | -745.0 |
-| 3 | +1170.8 | -1396.4 | -17.3 | 104.2 | -242.9 |
-| 4 | +1072.7 | -1573.1 | +0.5 | 84.8 | -500.0 |
-| 5 | +847.9 | -1575.2 | +0.8 | 87.0 | -726.4 |
-| 6 | +852.2 | -1748.2 | +1.0 | 88.9 | -895.0 |
+| 1 | +1,719.7 | -1,361.5 | +1.8 | 136.8 | +359.9 |
+| 2 | +738.5 | -1,482.6 | -0.8 | 82.7 | -745.0 |
+| 3 | +1,179.4 | -1,497.5 | -17.3 | 102.1 | -335.4 |
+| 4 | +1,082.8 | -1,556.3 | +0.6 | 84.6 | -472.8 |
+| 5 | +847.9 | -1,575.2 | +0.8 | 87.0 | -726.4 |
+| 6 | +852.2 | -1,748.2 | +1.0 | 88.9 | -895.0 |
 
 Over **40 seeds** (`--seed 1..40 --windows 12`, same config) the default run gives a mean PnL of
-**-538.5 USDC** (standard error 62.5, sd 395.1, median -478.2, range -1,162.4 to
-+339.0), positive in 2 of 40 runs, and the kill switch trips in 9 of them (a tripped run
-stops trading for the rest of its windows). Average trade 34.7 USDC (range 31.9 to
+**-535.9 USDC** (standard error 62.0, sd 392.3, median -480.0, range -1,126.1 to
++359.9), positive in 2 of 40 runs, and the kill switch trips in 10 of them (a tripped run
+stops quoting for the rest of its windows). Average trade 34.7 USDC (range 32.0 to
 36.4), so the source claim of about 53 is not reproduced; pair completion 92.7% on average; mean
-merge PnL +1,054.4 and mean flatten-sell PnL -1,593.5. The engine's Brier score is 0.0731 against
+merge PnL +1,055.4 and mean flatten-sell PnL -1,591.9. The engine's Brier score is 0.0731 against
 0.0728 for the market mid, so the model has no measurable skill over the market here. Read this
 as: on this simulator and with these uncalibrated defaults, the strategy earns its pair margin
 through merges and gives all of it (and a good deal more) back on the inventory it has to dump.
@@ -670,11 +670,11 @@ through merges and gives all of it (and a good deal more) back on the inventory 
 
 | Variant | What changes | Fills (mean) | PnL mean (s.e.) | Seeds with PnL > 0 | Kill switch trips |
 |---|---|---:|---:|---:|---:|
-| default | nothing | 909 | -462 (185) | 1 of 6 | 1 of 6 |
+| default | nothing | 913 | -469 (185) | 1 of 6 | 1 of 6 |
 | btc_only | `--assets BTC` | 494 | -183 (148) | 1 of 6 | 0 of 6 |
-| informed0 | `--set sim.informed_flow=0` (no sweeps) | 528 | -22 (59) | 3 of 6 | 0 of 6 |
-| lag0 | `--set sim.market_lag_seconds=0` | 916 | -874 (111) | 0 of 6 | 5 of 6 |
-| nodir | `--set directional.enabled=false` | 878 | -769 (174) | 1 of 6 | 3 of 6 |
+| informed0 | `--set sim.informed_flow=0` (no sweeps) | 527 | -16 (62) | 4 of 6 | 0 of 6 |
+| lag0 | `--set sim.market_lag_seconds=0` | 910 | -947 (103) | 0 of 6 | 5 of 6 |
+| nodir | `--set directional.enabled=false` | 878 | -763 (179) | 1 of 6 | 3 of 6 |
 | feeheavy | `--set fees.taker_fee_rate=1.0 --set fees.maker_fee_rate=0.01` | 686 | -865 (80) | 0 of 6 | 3 of 6 |
 
 Standard errors are across the six seeds, so differences of less than about two standard errors
@@ -684,12 +684,12 @@ simulator builds in on purpose (compare `lag0`). The sensitivity to the paper-ex
 
 | `exchange.latency_ticks` | Fills (mean) | PnL per seed (USDC) | PnL mean |
 |---:|---:|---|---:|
-| 0 | 1340 | +598, -131, +95 | +187 |
-| 1 (default) | 962 | +339, -745, -243 | -216 |
-| 2 | 1194 | -324, -1043, -1077 | -815 |
-| 3 | 1198 | -493, -1020, -804 | -772 |
+| 0 | 1342 | +603, -127, +116 | +197 |
+| 1 (default) | 968 | +360, -745, -335 | -240 |
+| 2 | 1204 | -325, -639, -1045 | -670 |
+| 3 | 1199 | -491, -1020, -804 | -771 |
 
-With three seeds these PnL means are noise (their standard errors are 153 to 313 USDC). The fill
+With three seeds these PnL means are noise (their standard errors are 154 to 322 USDC). The fill
 count no longer collapses as latency grows: a cancel takes as long as an order, so a quote that
 is re-priced every snapshot stays hittable for `latency_ticks` more snapshots, and those stale
 quotes are the adversely selected ones, which is why PnL falls with latency. (Before cancels
@@ -739,15 +739,15 @@ root-cause analysis of every anomaly that was looked for.
 **Limitations of this project:**
 
 * **Quote churn.** With the default parameters most orders are replaced right away: in the
-  default seed-1 run 79.1% of the post-only orders were cancelled by the engine one snapshot after
+  default seed-1 run 79.3% of the post-only orders were cancelled by the engine one snapshot after
   they were placed. The book moves nearly every second and the ladder is re-priced off the touch
-  (`sizing.requote_tolerance_ticks` is 0). Because a cancel takes as long as an order, the
-  replaced quotes stay hittable meanwhile: 72% of the maker fills of that run came from orders the
-  engine had already cancelled, and those fills are worse than the others (-1.40 against -1.07
-  cents from the mid at the moment of the fill). Fills and PnL therefore depend on the latency and
-  queue assumptions more than on the strategy.
-* **The default strategy loses on this simulator** (mean -538.5 USDC per 12-window run over 40
-  seeds, positive in 2 of them, kill switch tripped in 9). Whether that carries over to real
+  (`sizing.requote_tolerance_ticks` is 0; a tolerance only spares a bid when the touch moves up, never when it
+  moves down). Because a cancel takes as long as an order, the replaced quotes stay hittable meanwhile:
+  73% of the maker fills of that run came from orders the engine had already cancelled, and those
+  fills are worse than the others (-1.40 against -1.08 cents from the mid at the moment of the
+  fill). Fills and PnL therefore depend on the latency and queue assumptions more than on the strategy.
+* **The default strategy loses on this simulator** (mean -535.9 USDC per 12-window run over 40
+  seeds, positive in 2 of them, kill switch tripped in 10). Whether that carries over to real
   markets is unknown.
 * **The model is uncalibrated** and is no better than the market's mid price on synthetic data
   (Brier 0.0731 against 0.0728). Calibration tools exist (`fit_logistic_weights`, `brier_score`,
@@ -800,7 +800,7 @@ security and legal) that a research framework should not take on by default.
 ## Testing and invariants
 
 ```bash
-python3 -m pytest                     # the whole suite (2,076 tests, about 30 s, offline)
+python3 -m pytest                     # the whole suite (2,076 tests, about 35 s, offline)
 python3 -m pytest tests/test_paper_exchange.py -q
 ruff check . && ruff format --check . # lint and formatting (line length 100)
 mypy src                              # static typing (disallow_untyped_defs)

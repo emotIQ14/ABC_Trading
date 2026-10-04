@@ -99,5 +99,5 @@ min_order_size = 5.0        # minimum order size in shares
 mean_spread_ticks = 1.5     # average bid-ask spread in ticks
 depth_mean_shares = 400.0   # average displayed size per level
 n_levels = 5                # book levels per side
-uninformed_trades_per_sec = 0.3     # random touch trades per sec per token side
+uninformed_trades_per_sec = 0.3     # random touch trades per sec per market, each on both books
 informed_flow = 1.0         # 0 = no sweeps on price moves, i.e. no adverse selection
