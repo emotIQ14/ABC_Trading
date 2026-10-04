@@ -510,6 +510,53 @@ def test_paper_requires_the_acknowledgement_flag(capsys: pytest.CaptureFixture[s
 
 
 @pytest.mark.parametrize(
+    "flag", ["--i", "--i-und", "--i-understand", "--i-understand-this-is-paper-onl"]
+)
+def test_paper_acknowledgement_must_be_spelled_out_in_full(
+    flag: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # argparse accepts any unique prefix of an option by default; the guard is only a deliberate
+    # acknowledgement if the whole flag has to be typed
+    monkeypatch.setattr(cli, "_make_transport", lambda: DownTransport())
+    code, stdout, stderr = run_cli(capsys, "paper", flag)
+    assert (code, stdout) == (2, "")
+    assert f"unrecognized arguments: {flag}" in stderr
+    assert "cannot reach" not in stderr  # refused at parsing, before any network access
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["backtest", *SMALL, "--windows", "1", "--no-inv"],
+        ["backtest", *SMALL, "--wind", "1"],
+        ["backtest", *SMALL, "--windows", "1", "--sample", "10"],
+        ["replay", "x.jsonl", "--allow-un"],
+        ["config", "--se", "pair.target_margin=0.02"],
+        ["paper", "--i-understand-this-is-paper-only", "--max-ev", "3"],
+        ["paper", "--i-understand-this-is-paper-only", "--poll", "1"],
+    ],
+)
+def test_no_option_can_be_abbreviated(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    code, stdout, stderr = run_cli(capsys, *argv)
+    assert (code, stdout) == (2, "")
+    assert "unrecognized arguments" in stderr
+
+
+def test_record_option_cannot_be_abbreviated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "x.jsonl"
+    code, stdout, stderr = run_cli(capsys, "record", *SMALL, "--windows", "1", "--ou", str(target))
+    assert (code, stdout) == (2, "")
+    assert "required: --out" in stderr and not target.exists()  # `--ou` is not `--out`
+
+
+def test_the_full_option_names_still_work(capsys: pytest.CaptureFixture[str]) -> None:
+    code, stdout, _ = run_cli(capsys, "config", "--set", "pair.target_margin=0.02")
+    assert code == 0 and json.loads(stdout)["pair"]["target_margin"] == 0.02
+
+
+@pytest.mark.parametrize(
     ("args", "fragment"),
     [
         (["--poll-seconds", "0"], "must be a finite number > 0"),
@@ -533,6 +580,17 @@ def test_paper_option_errors_exit_2_before_any_network_access(
     assert (code, stdout) == (2, "")
     assert fragment in stderr
     assert transport.urls == []  # nothing was requested
+
+
+def test_paper_help_says_the_endpoints_are_unverified(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, stdout, _ = run_cli(capsys, "--help")
+    assert code == 0
+    listing = " ".join(stdout.split())
+    assert "paper" in listing and "UNVERIFIED" in listing
+    code, stdout, _ = run_cli(capsys, "paper", "--help")
+    assert code == 0 and "UNVERIFIED" in stdout and "inferred" in " ".join(stdout.split())
 
 
 def test_paper_reports_unreachable_data_clearly(
@@ -562,6 +620,10 @@ def test_paper_runs_the_feed_through_the_paper_exchange(
     assert re.search(r"Source +paper-live\n", stdout)
     assert "live feed stats: ticks=120, errors=0" in stdout
     assert "Public data only, simulated fills" in stderr
+    # the run's own output says the data path is unverified (not just the README)
+    assert "UNVERIFIED" in stderr and "inferred" in stderr
+    assert stdout.splitlines()[3].startswith("Data client UNVERIFIED")
+    assert "winners are inferred from Binance/Coinbase spot" in " ".join(stdout.split())
     # the CLI wired its options through to the feed factory
     assert seen["assets"] == ("BTC",) and seen["window_seconds"] == 300
     assert seen["poll_seconds"] == 2.0 and seen["max_events"] == 120

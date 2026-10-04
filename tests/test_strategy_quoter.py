@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import replace
+from functools import partial
 
 import pytest
 
@@ -34,7 +35,6 @@ from abc_trading.strategy.quoter import (
     max_bid_for_token,
     plan_tokens,
 )
-from abc_trading.strategy.risk import books_quotable
 from abc_trading.types import (
     EPS,
     BookSnapshot,
@@ -432,28 +432,190 @@ def test_book_exactly_at_the_spread_limit_still_quotes() -> None:
 # --------------------------------------------------------------------------- budget & min size
 
 
-def test_cash_budget_is_allocated_sequentially_across_levels() -> None:
-    # Budget 60: UP L0 100 @ 0.49 costs 49.0 -> 11.0 left; UP L1 at 0.48: 11 / 0.48 = 22.9166
-    # -> 22.91 (cost 10.9968); 0.0032 left: nothing else fits (and DOWN gets nothing).
+def test_cash_budget_is_split_evenly_level_by_level_when_flat() -> None:
+    # Flat: neither token completes pairs, so they are equals. Budget 60 cannot buy both level-0
+    # bids (2 x 49.0): each token gets half, 30 / 0.49 = 61.22 shares (cost 29.9978). The old
+    # UP-first allocation quoted UP only (100 @ 0.49 + 22.91 @ 0.48) and nothing on DOWN.
     qs = quotes(snap(), fv(0.5), inv_with(), budget=60.0)
-    assert view(qs) == [("UP", 0.49, 100.0), ("UP", 0.48, 22.91)]
+    assert view(qs) == [("UP", 0.49, 61.22), ("DOWN", 0.49, 61.22)]
     assert sum(q.price * q.size for q in qs) <= 60.0
-    # Budget 49 buys exactly UP L0.
-    assert view(quotes(snap(), fv(0.5), inv_with(), budget=49.0)) == [("UP", 0.49, 100.0)]
-    # Budget 100 = 49 + 70*0.48 (33.6) + 49*0.47 (23.03) = 105.63 would be needed for all UP:
-    # UP L0 49, L1 33.6, L2: 17.4 / 0.47 = 37.02 -> 37.02. Nothing is left for DOWN.
-    qs = quotes(snap(), fv(0.5), inv_with(), budget=100.0)
-    assert view(qs) == [("UP", 0.49, 100.0), ("UP", 0.48, 70.0), ("UP", 0.47, 37.02)]
+    # Budget 98 buys exactly the two level-0 bids; the 0 left funds nothing deeper.
+    assert view(quotes(snap(), fv(0.5), inv_with(), budget=98.0)) == [
+        ("UP", 0.49, 100.0),
+        ("DOWN", 0.49, 100.0),
+    ]
+    # Budget 100: level 0 costs 98, the 2.0 left is shared 1.0 each: 2.08 shares < min size 5.
+    assert view(quotes(snap(), fv(0.5), inv_with(), budget=100.0)) == [
+        ("UP", 0.49, 100.0),
+        ("DOWN", 0.49, 100.0),
+    ]
+    # Budget 200: level 0 (98) and level 1 (2 x 33.6 = 67.2) are bought whole, the 34.8 left is
+    # split for level 2 (49 shares @ 0.47 would cost 2 x 23.03): 17.4 / 0.47 = 37.02 shares each.
+    assert view(quotes(snap(), fv(0.5), inv_with(), budget=200.0)) == [
+        ("UP", 0.49, 100.0),
+        ("UP", 0.48, 70.0),
+        ("UP", 0.47, 37.02),
+        ("DOWN", 0.49, 100.0),
+        ("DOWN", 0.48, 70.0),
+        ("DOWN", 0.47, 37.02),
+    ]
+
+
+def test_a_budget_too_small_to_rest_both_sides_does_not_pick_a_side_by_label() -> None:
+    # min order size 30: a 25 USDC budget split in two (12.5 -> 25.51 shares) rests neither bid,
+    # and neither token may take it all just because it is listed first: nothing is quoted. A
+    # one-sided UP quote would also differ from the label-swapped market.
+    big_min = MarketSpec("m1", "BTC", 1000.0, 1900.0, min_order_size=30.0)
+    assert quotes(snap(market=big_min), fv(0.5), inv_with(), budget=25.0) == []
+    # Budget 40 does fit both halves (20 / 0.49 = 40.81 >= 30).
+    qs = quotes(snap(market=big_min), fv(0.5), inv_with(), budget=40.0)
+    assert view(qs) == [("UP", 0.49, 40.81), ("DOWN", 0.49, 40.81)]
+    # When only one bid can rest at all (DOWN at 0.19 is cheap; UP's 30 shares would cost 14.7 and
+    # the equal share 12.5 is too small), the one that can rest takes the budget: it is no tie.
+    qs = quotes(snap(market=big_min), fv(0.8), inv_with(), budget=25.0)
+    assert view(qs) == [("DOWN", 0.19, 100.0)]
+
+
+def test_a_cheaper_bid_is_funded_whole_and_the_other_token_takes_the_rest() -> None:
+    # Fair UP 0.8: flat, UP bids 0.49 (cap 0.795, touch 0.49) and DOWN bids 0.19 (cap 0.195), so
+    # DOWN level 0 costs only 19.0. Budget 60 split evenly would be 30 each; DOWN needs 19, so it
+    # is funded whole and UP gets the other 41: 41 / 0.49 = 83.67 shares (max-min fair split).
+    qs = quotes(snap(), fv(0.8), inv_with(), budget=60.0)
+    assert view(qs) == [("UP", 0.49, 83.67), ("DOWN", 0.19, 100.0)]
+    assert sum(q.price * q.size for q in qs) <= 60.0
+
+
+def test_scarce_cash_funds_the_pair_completing_token_first() -> None:
+    # 150 UP held: DOWN completes pairs (pair cap 0.52, resting at 0.49 / 0.48 / 0.47). Budget 60
+    # goes to the completing DOWN ladder: 100 @ 0.49 (49.0) then 11.0 / 0.48 = 22.91 shares. The
+    # heavy UP token, which only adds risk, gets nothing (the old UP-first order gave the whole
+    # budget to UP and starved DOWN).
+    heavy_up = inv_with(up=150)
+    qs = quotes(snap(), fv(0.5), heavy_up, budget=60.0)
+    assert view(qs) == [("DOWN", 0.49, 100.0), ("DOWN", 0.48, 22.91)]
+    # A budget of 120 buys the whole DOWN ladder (49 + 33.6 + 23.03 = 105.63) first; only the
+    # 14.37 left funds the heavy UP token (skewed 1.5 ticks down to 0.47): 14.37 / 0.47 = 30.57.
+    qs = quotes(snap(), fv(0.5), heavy_up, budget=120.0)
+    assert view(qs) == [
+        ("UP", 0.47, 30.57),
+        ("DOWN", 0.49, 100.0),
+        ("DOWN", 0.48, 70.0),
+        ("DOWN", 0.47, 49.0),
+    ]
+    assert sum(q.price * q.size for q in qs) <= 120.0
+    # The same economics with the labels swapped: DOWN heavy, UP completes (pair cap 0.47).
+    heavy_down = inv_with(down=150, down_px=0.52)
+    qs = quotes(snap(), fv(0.5), heavy_down, budget=60.0)
+    assert view(qs) == [("UP", 0.47, 100.0), ("DOWN", 0.47, 27.65)]
+    # A completing token that is skipped (the engine completes it by taker order) uses no budget:
+    # the heavy token then takes it, as before.
+    qs = quotes(snap(), fv(0.5), heavy_up, budget=60.0, skip=(DOWN,))
+    assert view(qs) == [("UP", 0.47, 100.0), ("UP", 0.46, 28.26)]
+
+
+def _mirrored(
+    s: MarketSnapshot, fair: FairValue, inv: MarketInventory
+) -> tuple[MarketSnapshot, FairValue, MarketInventory]:
+    """The same economics with the UP / DOWN labels swapped (books, fair value, inventory)."""
+    swapped_snap = MarketSnapshot(
+        s.ts,
+        s.market,
+        BookSnapshot(UP, s.down_book.bids, s.down_book.asks),
+        BookSnapshot(DOWN, s.up_book.bids, s.up_book.asks),
+        spot=s.spot,
+        spot_ts=s.spot_ts,
+        ref_price=s.ref_price,
+    )
+    swapped_fair = FairValue(
+        1.0 - fair.p_up, 1.0 - fair.p_up_model, -fair.z, -fair.z_adj, fair.sigma, fair.tau,
+        -fair.momentum, -fair.accel, -fair.book_imbalance, fair.valid,
+    )  # fmt: skip
+    swapped_inv = MarketInventory(inv.market_id)
+    for token in (UP, DOWN):
+        qty, cost = inv.qty[token], inv.cost[token]
+        swapped_inv.qty[token.opposite] = qty
+        swapped_inv.cost[token.opposite] = cost
+    return swapped_snap, swapped_fair, swapped_inv
+
+
+def _label_swapped(qs: list[QuoteLevel]) -> list[tuple[str, float, float]]:
+    return sorted((q.token.opposite.value, q.price, q.size) for q in qs)
+
+
+@pytest.mark.parametrize("p_up", [0.5, 0.25, 0.75])
+@pytest.mark.parametrize("held", [(0, 0), (150, 0), (0, 150), (100, 100), (400, 0), (60, 200)])
+@pytest.mark.parametrize("budget", [8.0, 25.0, 49.0, 60.0, 98.0, 120.0, 250.0, 1e6])
+def test_a_binding_budget_treats_mirror_image_states_alike(
+    p_up: float, held: tuple[float, float], budget: float
+) -> None:
+    # Prices are the same in both labelings (equal average costs), so swapping the labels of the
+    # whole state must swap the labels of the quotes and nothing else, also when cash is scarce.
+    inv = inv_with(up=held[0], down=held[1], up_px=0.5, down_px=0.5)
+    up_bid = round(p_up - 0.01, 2)
+    s = snap(
+        up=(up_bid, round(p_up + 0.01, 2)),
+        down=(round(1 - p_up - 0.01, 2), round(1 - p_up + 0.01, 2)),
+    )
+    fair = fv(p_up)
+    qs = quotes(s, fair, inv, budget=budget)
+    m_snap, m_fair, m_inv = _mirrored(s, fair, inv)
+    assert _label_swapped(qs) == sorted(view(quotes(m_snap, m_fair, m_inv, budget=budget)))
+
+
+def test_mirror_image_states_get_mirror_image_quotes_over_random_binding_budgets() -> None:
+    rng = random.Random(77)
+    counts = {"binding": 0, "binding_two_sided": 0, "binding_completing": 0}
+    for _ in range(800):
+        cfg = _random_cfg(rng)
+        p_up = rng.choice([0.25, 0.375, 0.5, 0.625, 0.75])  # 1 - p is exact: no float noise
+        spread = rng.choice([1, 1, 2, 3])
+        up_bid = round(p_up - 0.01, 2)
+        dn_bid = round(1 - p_up - 0.01, 2)
+        s = snap(
+            up=(up_bid, round(up_bid + 0.01 * spread, 2)),
+            down=(dn_bid, round(dn_bid + 0.01 * spread, 2)),
+        )
+        held = rng.choice([(0, 0), (150, 0), (0, 150), (100, 100), (400, 0), (0, 400), (60, 200)])
+        px = rng.choice([0.4, 0.5, 0.55])
+        inv = inv_with(up=held[0], down=held[1], up_px=px, down_px=px)
+        fair = fv(p_up)
+        phase = rng.choice([ACC, ACC, ACC, WD])
+        clip = rng.choice([20.0, 100.0, 400.0])
+        budget = rng.uniform(12.0, 120.0)
+        m_snap, m_fair, m_inv = _mirrored(s, fair, inv)
+
+        run = partial(quotes, phase=phase, cfg=cfg, clip=clip)
+
+        qs = run(s, fair, inv, budget=budget)
+        assert _label_swapped(qs) == sorted(view(run(m_snap, m_fair, m_inv, budget=budget)))
+        assert sum(q.price * q.size * (1 + cfg.fees.maker_fee_rate) for q in qs) <= budget + 1e-9
+        if run(s, fair, inv, budget=1e9) != qs:
+            counts["binding"] += 1
+            counts["binding_two_sided"] += int({q.token for q in qs} == {UP, DOWN})
+            counts["binding_completing"] += int(held[0] != held[1])
+    # The test must not be vacuous: the budget limited many states, on both sides, with and
+    # without a completing token.
+    assert counts["binding"] > 150
+    assert counts["binding_two_sided"] > 50
+    assert counts["binding_completing"] > 50
 
 
 def test_zero_or_tiny_budget_yields_no_quotes() -> None:
     assert quotes(snap(), fv(0.5), inv_with(), budget=0.0) == []
+
     # min_order_size is 5: 5 shares cost 2.45 at 0.49, 2.40 at 0.48 and 2.35 at 0.47, and a
     # cheaper deeper level can afford the minimum when the touch level cannot.
-    assert quotes(snap(), fv(0.5), inv_with(), budget=2.3) == []
-    assert view(quotes(snap(), fv(0.5), inv_with(), budget=2.35)) == [("UP", 0.47, 5.0)]
-    assert view(quotes(snap(), fv(0.5), inv_with(), budget=2.4)) == [("UP", 0.48, 5.0)]
-    assert view(quotes(snap(), fv(0.5), inv_with(), budget=2.45)) == [("UP", 0.49, 5.0)]
+    # (One token is quoted alone here: with both tokens quoted a budget this small cannot rest a
+    # minimum order on each side, so neither is funded, see the min-size test above.)
+    def one(budget: float) -> list[tuple[str, float, float]]:
+        return view(quotes(snap(), fv(0.5), inv_with(), budget=budget, skip=(DOWN,)))
+
+    assert one(2.3) == []
+    assert one(2.35) == [("UP", 0.47, 5.0)]
+    assert one(2.4) == [("UP", 0.48, 5.0)]
+    assert one(2.45) == [("UP", 0.49, 5.0)]
+    for budget in (2.3, 2.35, 2.4, 2.45):
+        assert quotes(snap(), fv(0.5), inv_with(), budget=budget) == []
 
 
 def test_orders_below_min_order_size_are_dropped() -> None:
@@ -476,11 +638,15 @@ def test_maker_fee_reduces_the_cap_and_is_charged_to_the_budget() -> None:
     # The pair cap shrinks too: (1 - 0.01 - 0.47) / 1.02.
     assert cap(DOWN, fv(0.5), inv_with(up=100), cfg=cfg) == pytest.approx(0.52 / 1.02)
     # The cash needed per level includes the fee: 100 shares @ 0.48 cost 48 * 1.02 = 48.96.
-    qs = quotes(snap(), fv(0.5), inv_with(), cfg=cfg, budget=48.96)
+    # (UP alone: with both tokens quoted a budget is split between them.)
+    qs = quotes(snap(), fv(0.5), inv_with(), cfg=cfg, budget=48.96, skip=(DOWN,))
     assert view(qs) == [("UP", 0.48, 100.0)]
     # 48.95 / (0.48 * 1.02 = 0.4896 per share) = 99.9796 -> 99.97 shares (cost 48.9451).
-    qs = quotes(snap(), fv(0.5), inv_with(), cfg=cfg, budget=48.95)
+    qs = quotes(snap(), fv(0.5), inv_with(), cfg=cfg, budget=48.95, skip=(DOWN,))
     assert view(qs) == [("UP", 0.48, 99.97)]
+    # Both tokens share 97.92 evenly: 48.96 each, so the fee is charged on each side.
+    qs = quotes(snap(), fv(0.5), inv_with(), cfg=cfg, budget=97.92)
+    assert view(qs) == [("UP", 0.48, 100.0), ("DOWN", 0.48, 100.0)]
 
 
 def test_maker_rebate_never_raises_the_cap() -> None:
@@ -503,6 +669,22 @@ def test_favoured_cap_rises_to_fair_minus_min_edge_when_that_is_higher() -> None
     # Symmetric for a negative target.
     assert cap(DOWN, fv(0.5), inv_with(), cfg=cfg, target=-100.0) == pytest.approx(0.5)
     assert cap(UP, fv(0.5), inv_with(), cfg=cfg, target=-100.0) == pytest.approx(0.495)
+    # A token is favoured only while the target asks for MORE than is held: net +50 of +100 still
+    # raises the cap; once the target is reached (+100) or passed (+150) the balanced cap is back.
+    for held, raised in ((50, True), (100, False), (150, False)):
+        want = 0.5 if raised else 0.495
+        assert cap(UP, fv(0.5), inv_with(up=held), cfg=cfg, target=100.0) == pytest.approx(want)
+        mirror = cap(DOWN, fv(0.5), inv_with(down=held), cfg=cfg, target=-100.0)
+        assert mirror == pytest.approx(want)
+
+
+def test_a_token_worth_two_cents_still_bids_one_tick() -> None:
+    # DOWN is worth 0.02: cap 0.015 floors to 0.01, exactly one tick and a valid price (a cap of
+    # 0.009 would floor to 0 and quote nothing). The cap binds far below the touch, so the three
+    # levels collapse onto the one price.
+    qs = quotes(snap(), fv(0.98), inv_with())
+    assert [(q.price, q.size) for q in qs if q.token is DOWN] == [(0.01, 100.0)]
+    assert [(q.price, q.size) for q in qs if q.token is UP][0] == (0.49, 100.0)
 
 
 def test_tilt_moves_the_ladder_and_skews_the_unfavoured_side() -> None:
@@ -652,6 +834,63 @@ def test_plan_tokens_exposes_ceiling_room_and_scale() -> None:
     assert all(p.ceiling is None and p.room == 0.0 for p in done.values())
 
 
+@pytest.mark.parametrize(
+    ("token", "held", "target", "fair_up"),
+    [(UP, {"up": 60.0}, 100.0, 0.7), (DOWN, {"down": 60.0}, -100.0, 0.3)],
+)
+def test_wind_down_room_of_the_favoured_token_is_the_remaining_directional_budget(
+    token: Outcome, held: dict[str, float], target: float, fair_up: float
+) -> None:
+    # DESIGN 2.2(5): in WIND_DOWN the model-favoured token is quoted "within the directional
+    # budget": the target minus the net exposure already held toward it (here 100 - 60 = 40 shares,
+    # not 100 + 60, and not the full 100 that a flat book would get).
+    qs = quotes(snap(), fv(fair_up), inv_with(**held), phase=WD, target=target)
+    assert sum(q.size for q in qs if q.token is token) == 40.0
+    flat = quotes(snap(), fv(fair_up), inv_with(), phase=WD, target=target)
+    assert sum(q.size for q in flat if q.token is token) == 100.0  # clip 100 < the 100-share room
+    reached = quotes(
+        snap(), fv(fair_up), inv_with(**{k: 100.0 for k in held}), phase=WD, target=target
+    )
+    assert [q for q in reached if q.token is token] == []
+
+
+def test_wind_down_room_of_a_token_that_completes_pairs_and_is_favoured() -> None:
+    # 80 unpaired DOWN, target +100 UP: UP completes the 80 pairs AND is the favoured token, so its
+    # room is the pairs plus the whole directional budget (max of the two rules, which add up
+    # because holding the 80 DOWN is a net of -80, 180 shares below the +100 wanted).
+    # (A big clip, so that the room and not the level size is what limits the order; the pair
+    # cap 0.99 - 0.52 = 0.47 puts every level at one price, so there is a single level.)
+    qs = quotes(snap(), fv(0.7), inv_with(down=80), phase=WD, target=100.0, clip=400.0)
+    assert [(q.token, q.price, q.size) for q in qs] == [(UP, 0.47, 180.0)]
+    # Not favoured (no directional target): only the 80 pairs.
+    qs = quotes(snap(), fv(0.7), inv_with(down=80), phase=WD, target=0.0, clip=400.0)
+    assert [(q.token, q.price, q.size) for q in qs] == [(UP, 0.47, 80.0)]
+
+
+def test_plan_tokens_blocks_a_token_that_cannot_carry_a_bid() -> None:
+    # `ceiling is None` is what the engine reads as "no bid of this token may rest" (it cancels
+    # such orders inside the requote throttle), so every reason a token is out must say it.
+    # (1) no room under max_net_imbalance_shares (net +300): UP is hard-stopped.
+    plans = plan_tokens(
+        snap=snap(), fair=fv(0.5), inv=inv_with(up=300), phase=ACC, cfg=CFG, target_net=0.0
+    )
+    assert (plans[UP].ceiling, plans[UP].room) == (None, 0.0)
+    assert plans[UP].cap == pytest.approx(0.495) and plans[DOWN].ceiling == 0.50
+    # (2) the unfavoured token once the directional target is reached: scale 0, even though it
+    # completes pairs (and would have room): its bids are removed, not merely resized.
+    plans = plan_tokens(
+        snap=snap(), fair=fv(0.98), inv=inv_with(up=200), phase=ACC, cfg=CFG, target_net=200.0
+    )
+    assert (plans[DOWN].ceiling, plans[DOWN].size_scale) == (None, 0.0)
+    assert plans[DOWN].cap == pytest.approx(0.52) and plans[DOWN].room == 0.0
+    # (3) a cap below one tick: DOWN worth 0.01 has cap 0.005, which snaps down to 0.
+    plans = plan_tokens(
+        snap=snap(), fair=fv(0.99), inv=inv_with(), phase=ACC, cfg=CFG, target_net=0.0
+    )
+    assert plans[DOWN].cap == pytest.approx(0.005) and plans[DOWN].ceiling is None
+    assert plans[UP].ceiling == 0.50
+
+
 def test_quotes_are_deterministic_and_ordered() -> None:
     inv = inv_with(up=120, down=40)
     a = quotes(snap(), fv(0.55), inv, target=30.0)
@@ -715,7 +954,30 @@ def _random_snapshot(rng: random.Random) -> MarketSnapshot:
     dn_ask = None if up_bid is None else round(1.0 - up_bid, 6)
     if rng.random() < 0.05:
         dn_bid, dn_ask = round(rng.uniform(0.02, 0.5), 2), round(rng.uniform(0.5, 0.98), 2)
+    elif rng.random() < 0.25:
+        # a DOWN book of its own: separately fetched books need not mirror each other, so one of
+        # them can be wide (or crossed) while the other is tight
+        d_bid = rng.randint(1, n_ticks - 2)
+        d_ask = d_bid + rng.choice([-1, 1, 1, 2, 3, 6, 7])
+        dn_bid, dn_ask = round(d_bid * tick, 6), round(min(d_ask, n_ticks) * tick, 6)
     return snap(up=(up_bid, up_ask), down=(dn_bid, dn_ask), market=market)
+
+
+def _quotable_by_hand(s: MarketSnapshot, max_ticks: int) -> bool:
+    """DESIGN 2.2(5) from first principles (not the implementation's ``books_quotable``): both
+    books have a bid and an ask inside [0, 1], the bid strictly below the ask, and a spread of at
+    most ``max_ticks`` ticks. Counted in whole ticks, so no float tolerance is involved."""
+    tick = s.market.tick_size
+    for bk in (s.up_book, s.down_book):
+        if not bk.bids or not bk.asks:
+            return False
+        bid, ask = bk.bids[0].price, bk.asks[0].price
+        if not all(math.isfinite(x) and -1e-9 <= x <= 1.0 + 1e-9 for x in (bid, ask)):
+            return False
+        spread_ticks = round((ask - bid) / tick, 6)
+        if spread_ticks <= 0 or spread_ticks > max_ticks:
+            return False
+    return True
 
 
 def _random_inventory(rng: random.Random, max_side: float) -> MarketInventory:
@@ -781,7 +1043,7 @@ def test_randomised_states_respect_every_quoting_invariant() -> None:
             clip_shares=clip, cash_budget=budget, target_net=target,
         )  # fmt: skip
 
-        quotable = books_quotable(s, cfg.risk.max_spread_ticks_to_quote)
+        quotable = _quotable_by_hand(s, cfg.risk.max_spread_ticks_to_quote)
         if phase not in (ACC, WD) or not quotable:
             assert out == []  # no quotes in WARMUP/FLATTEN/DONE or on a bad book
             counts["empty_blocked"] += 1

@@ -233,6 +233,20 @@ def test_completion_directional_allowance_is_not_rebalanced() -> None:
     ]
 
 
+def test_completion_directional_allowance_of_a_deliberate_down_position() -> None:
+    # The mirror of the test above. DOWN bought at 0.47, so completing with UP at its 0.51 ask
+    # locks a profit; a negative target is deliberate DOWN exposure.
+    short, cheap = fv(0.3), {"down_px": 0.47}
+    # Target -100 DOWN: of 150 unpaired DOWN, 100 is deliberate -> excess 50 < trigger 100.
+    assert completion(snap(), inv_with(down=150, **cheap), fair=short, target=-100.0) == []
+    # 250 unpaired: excess 150, so exactly the excess is completed, by buying UP.
+    plans = completion(snap(), inv_with(down=250, **cheap), fair=short, target=-100.0)
+    assert [(p.token, p.size) for p in plans] == [(UP, 150.0)]
+    # A target in the OTHER direction gives a heavy DOWN no allowance: all 150 are unintended.
+    plans = completion(snap(), inv_with(down=150, **cheap), fair=fv(0.7), target=100.0)
+    assert [(p.token, p.size) for p in plans] == [(UP, 150.0)]
+
+
 def test_completion_needs_a_usable_ask_and_an_unpaired_inventory() -> None:
     assert completion(snap(down=book(DOWN, 0.49, None)), inv_with(up=150)) == []
     assert completion(snap(down=BookSnapshot(DOWN)), inv_with(up=150)) == []
@@ -290,6 +304,45 @@ def test_flatten_hold_margin_boundary() -> None:
     # bid 0.49, hold_margin 0.02: p = 0.51 -> 0.51 - 0.49 = 0.02 -> hold; p = 0.5099 -> sell.
     assert flatten(snap(), inv, fv(0.51), cfg=cfg).sells == ()
     assert flatten(snap(), inv, fv(0.5099), cfg=cfg).sells == (SellOrder(UP, 0.49, 40.0),)
+
+
+@pytest.mark.parametrize(("heavy", "bid"), [(UP, 0.49), (UP, 0.30), (DOWN, 0.70), (DOWN, 0.52)])
+def test_flatten_hold_test_credits_the_taker_fee_of_the_sale(heavy: Outcome, bid: float) -> None:
+    # DESIGN 2.6: hold iff p_T - (bid_T - taker_fee_per_share(bid_T)) >= hold_margin. The fee the
+    # sale would pay is part of what holding saves, so the break-even p_T is
+    # bid + hold_margin - fee, a fee-width BELOW the fee-less bid + hold_margin. Probe a hair on
+    # each side of it, for both tokens and for fees of different size (the fee depends on the bid).
+    fee = FEES.taker_fee_per_share(bid)
+    margin = CFG.directional.hold_margin
+    breakeven = bid + margin - fee
+    own = book(heavy, bid, round(bid + 0.02, 2))
+    mirror = book(heavy.opposite, round(1.0 - bid - 0.02, 2), round(1.0 - bid, 2))
+    s = snap(up=own, down=mirror) if heavy is UP else snap(up=mirror, down=own)
+    inv = inv_with(40, 0) if heavy is UP else inv_with(0, 40)
+
+    def fair(p_heavy: float) -> FairValue:
+        return fv(p_heavy if heavy is UP else 1.0 - p_heavy)
+
+    held = flatten(s, inv, fair(breakeven + 1e-4))
+    assert (held.sells, held.hold_token, held.hold_size, held.reason) == (
+        (), heavy, 40.0, REASON_EDGE,
+    )  # fmt: skip
+    assert breakeven + 1e-4 - bid < margin  # inside the band: the fee-less rule would sell it
+    sold = flatten(s, inv, fair(breakeven - 1e-4))
+    assert sold.sells == (SellOrder(heavy, bid, 40.0),)
+    assert (sold.hold_size, sold.reason) == (0.0, REASON_SELL)
+
+
+def test_flatten_merges_every_whole_pair_even_below_merge_min_pairs() -> None:
+    # DESIGN 2.3: merge at merge_min_pairs "or any pairs in FLATTEN". 30 pairs are below the
+    # threshold of 50 but are merged at once, with or without an unpaired remainder to resolve.
+    plan = flatten(snap(), inv_with(30, 30), fv(0.5))
+    assert (plan.merge_size, plan.sells, plan.reason) == (30.0, (), REASON_FLAT)
+    plan = flatten(snap(), inv_with(70, 30), fv(0.5))
+    assert plan.merge_size == 30.0
+    assert plan.sells == (SellOrder(UP, 0.49, 40.0),)
+    assert flatten(snap(), inv_with(30.9, 30.9), fv(0.5)).merge_size == 30.0  # whole pairs only
+    assert flatten(snap(), inv_with(0.9, 0.9), fv(0.5)).merge_size == 0.0
 
 
 def test_flatten_hold_is_capped_by_max_directional_shares() -> None:

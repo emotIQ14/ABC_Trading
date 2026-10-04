@@ -10,9 +10,15 @@ Contract (every implementation must honour it):
 
 * ``submit`` never raises for a bad *order*; it returns ``SubmitResult(ok=False, reason=...)``.
   An accepted order gets a unique ``order_id``.
-* ``cancel`` returns ``True`` iff an open (live or in-flight) order was removed.
+* ``cancel`` is a message to the venue like an order, so it takes the same time to land: it returns
+  ``True`` iff the request was accepted (the order is open, live or in flight, and no cancel for it
+  is pending yet). An implementation with a non-zero order latency must apply the same latency to
+  the cancel: until it lands the order can still fill, so a quote is not safe from prints just
+  because the strategy has already decided to drop it. A cancel never overtakes the order it
+  targets. ``PaperExchange`` documents the details (funds, stats, ``pending_cancels``).
 * ``merge`` returns ``None`` when it cannot merge ``size`` pairs, otherwise a ``MergeResult``.
-* ``open_orders`` returns copies, so callers can never mutate exchange state.
+* ``open_orders`` returns copies, so callers can never mutate exchange state. Orders whose cancel
+  was accepted but has not landed are not reported: the caller already asked for them to go.
 * ``process`` feeds one market snapshot to the exchange and returns the fills it caused. Fills
   never come from market data older than the moment the order became live (no look-ahead).
 * ``balance`` is free cash in USDC (reservations for resting bids are *not* deducted from it);
@@ -43,7 +49,10 @@ class Exchange(Protocol):
         ...
 
     def cancel(self, order_id: str, ts: float) -> bool:
-        """Cancel an open order; ``False`` if it is unknown or already filled/cancelled."""
+        """Ask for an open order to be cancelled; it lands after the order latency.
+
+        ``False`` if the order is unknown, already filled/cancelled or already being cancelled.
+        """
         ...
 
     def merge(self, market_id: str, size: float, ts: float) -> MergeResult | None:
@@ -51,7 +60,7 @@ class Exchange(Protocol):
         ...
 
     def open_orders(self, market_id: str | None = None) -> list[OpenOrder]:
-        """Copies of the open orders (all markets when ``market_id`` is None)."""
+        """Copies of the open orders, without those being cancelled (all markets when ``None``)."""
         ...
 
     def process(self, snap: MarketSnapshot) -> list[Fill]:

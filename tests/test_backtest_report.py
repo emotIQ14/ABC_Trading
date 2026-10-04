@@ -19,6 +19,7 @@ from abc_trading.backtest.report import (
     GENERIC_NOTE,
     MAX_MARKET_ROWS,
     PAPER_BANNER,
+    PAPER_UNVERIFIED_NOTE,
     RUN_FILES,
     SYNTHETIC_BANNER,
     format_report,
@@ -39,7 +40,7 @@ from abc_trading.backtest.runner import (
 )
 from abc_trading.config import BotConfig, config_from_dict, config_to_dict
 from abc_trading.sim.feed import SyntheticFeed
-from abc_trading.types import Fill, Outcome, Side
+from abc_trading.types import FeedEvent, Fill, MarketResolved, Outcome, Side
 
 UP, DOWN = Outcome.UP, Outcome.DOWN
 
@@ -83,8 +84,24 @@ def make_result(label: str = "synthetic:unit", **overrides: object) -> BacktestR
         activity=ActivityStats(3, 3, 0, 3, 0, 107.0, 0.0, 107.0 / 3.0, 49.0),
         pairs=PairStats(1, 1, 220.0, 100.0, 0.0, 100.0, 200.0 / 220.0, 0.98, None, 1, 1.0, 1.0),
         pnl=PnLStats(
-            1, 13.0, 0.0, 0.0, 13.0, 13.0, 1.0, 0.0, 2.0, 0.0, 11.0, 0.0, 10_013.0, 0.0, 0.0
-        ),
+            n_markets_resolved=1,
+            n_markets_resolved_traded=1,
+            mean_market_pnl=13.0,
+            std_market_pnl=0.0,
+            sharpe_like=0.0,
+            best_market_pnl=13.0,
+            worst_market_pnl=13.0,
+            win_rate_traded=1.0,
+            pnl_sell=0.0,
+            pnl_merge=2.0,
+            pnl_settle_pair=0.0,
+            pnl_settle_directional=11.0,
+            pnl_unrealised=0.0,
+            fees_paid=0.0,
+            peak_equity=10_013.0,
+            max_drawdown_usd=0.0,
+            max_drawdown_frac=0.0,
+        ),  # fmt: skip
         calibration=CalibrationStats(1, 1, 0, 0, 0.1, 0.12, 0.2, 0.5),
         unresolved_markets=[],
         markets=[record()],
@@ -171,11 +188,13 @@ def test_report_rows_for_a_hand_built_result() -> None:
     assert res["Kill switch"] == "not tripped"
 
     pnl = section(text, "Per-market PnL")
-    assert pnl["Markets resolved"] == "1 (1 traded)"
+    assert pnl["Markets resolved"] == "1 of 1 (1 traded)"
     assert pnl["Mean / std per market"] == "+13.00 / 0.00"
     assert pnl["Win rate (traded markets)"] == "100.0%"
     assert pnl["PnL from merges"] == "+2.00"
     assert pnl["PnL at settlement, directional"] == "+11.00"
+    assert pnl["Unrealised, open inventory at mid"] == "+0.00"
+    assert "Statistics cover" not in pnl  # every market is resolved: nothing to qualify
     assert pnl["Fees paid (inside the above)"] == "0.00"
 
     act = section(text, "Trading activity")
@@ -269,6 +288,204 @@ def test_report_of_an_empty_run_prints_n_a_instead_of_crashing() -> None:
     assert section(text, "Pairing and inventory")["Pair completion rate"] == "n/a"
     assert section(text, "Run")["Time span (unix s)"] == "n/a .. n/a"
     assert "Markets\n-------" in text
+
+
+# --------------------------------------------------------------------------- unresolved markets
+# A paper run (and `replay --allow-unresolved`) ends with markets still open: those markets count
+# in Total PnL (marked at the last mids), in the pairing section and in the markets table, so the
+# PnL block must not silently leave them out.
+
+
+def num(text: str) -> float:
+    return float(text.replace(",", ""))
+
+
+def short_sim_cfg(n_windows: int) -> BotConfig:
+    base = BotConfig()
+    return replace(base, sim=replace(base.sim, seed=1, n_windows=n_windows))
+
+
+@pytest.fixture(scope="module")
+def truncated() -> BacktestResult:
+    """What `paper` sees on Ctrl-C inside the first window: nothing has resolved yet."""
+    cfg = short_sim_cfg(1)
+    events = [e for e in SyntheticFeed(cfg) if not isinstance(e, MarketResolved)]
+    return run_backtest(cfg, events[:1400], source_label="paper-live", allow_unresolved=True)
+
+
+@pytest.fixture(scope="module")
+def partial() -> BacktestResult:
+    """Window 1 resolved (BTC and ETH), window 2 cut after 300 events (both still open)."""
+    cfg = short_sim_cfg(2)
+    events: list[FeedEvent] = list(SyntheticFeed(cfg))
+    second_resolution = [i for i, e in enumerate(events) if isinstance(e, MarketResolved)][1]
+    return run_backtest(
+        cfg, events[: second_resolution + 1 + 300], source_label="paper-live",
+        allow_unresolved=True,
+    )  # fmt: skip
+
+
+def decomposition(r: BacktestResult) -> dict[str, float]:
+    """The PnL rows of the report as numbers."""
+    pnl = section(format_report(r), "Per-market PnL")
+    keys = {
+        "merge": "PnL from merges",
+        "sell": "PnL from sells (flatten)",
+        "settle_pair": "PnL at settlement, pairs",
+        "settle_dir": "PnL at settlement, directional",
+        "unrealised": "Unrealised, open inventory at mid",
+        "fees": "Fees paid (inside the above)",
+    }
+    return {name: num(pnl[label]) for name, label in keys.items()}
+
+
+def test_pnl_rows_cover_every_market_and_add_up_to_total_pnl_in_a_partial_run(
+    partial: BacktestResult,
+) -> None:
+    r = partial
+    assert (len(r.unresolved_markets), r.pairs.n_markets) == (2, 4)
+    resolved, still_open = (
+        [m for m in r.markets if m.resolved],
+        [m for m in r.markets if not m.resolved],
+    )
+    # the open markets really did merge, sell or pay fees: leaving them out would change the rows
+    assert sum(m.merge_pnl for m in still_open) != pytest.approx(0.0, abs=0.01)
+    assert sum(m.fees_paid for m in still_open) > 0.0
+    rows = decomposition(r)
+    assert rows["merge"] == pytest.approx(sum(m.merge_pnl for m in r.markets), abs=0.006)
+    assert rows["sell"] == pytest.approx(sum(m.sell_pnl for m in r.markets), abs=0.006)
+    assert rows["settle_pair"] == pytest.approx(sum(m.settle_pair_pnl for m in resolved), abs=0.006)
+    assert rows["fees"] == pytest.approx(sum(f.fee for f in r.fills), abs=0.006)
+    # ... and, with the unrealised row, the five rows reconcile with Total PnL
+    parts = rows["merge"] + rows["sell"] + rows["settle_pair"] + rows["settle_dir"]
+    assert parts + rows["unrealised"] == pytest.approx(r.total_pnl, abs=0.03)
+    assert rows["unrealised"] != pytest.approx(0.0, abs=0.01)
+    p = r.pnl
+    exact = p.pnl_sell + p.pnl_merge + p.pnl_settle_pair + p.pnl_settle_directional
+    assert exact + p.pnl_unrealised == pytest.approx(r.total_pnl, abs=1e-9)
+
+
+def test_pnl_rows_of_a_run_that_has_not_resolved_anything_are_not_all_zero(
+    truncated: BacktestResult,
+) -> None:
+    r = truncated
+    assert r.pnl.n_markets_resolved == 0 and len(r.unresolved_markets) == r.pairs.n_markets == 2
+    merged = sum(m.merge_pnl for m in r.markets)
+    assert merged > 1.0 and r.pairs.merged_pairs > 0  # the pairing section reports merges ...
+    rows = decomposition(r)
+    assert rows["merge"] == pytest.approx(merged, abs=0.006)  # ... so the PnL block must too
+    assert rows["fees"] == pytest.approx(sum(f.fee for f in r.fills), abs=0.006)
+    assert rows["fees"] > 0.0
+    assert (rows["settle_pair"], rows["settle_dir"]) == (0.0, 0.0)  # nothing settled
+    parts = rows["merge"] + rows["sell"] + rows["unrealised"]
+    assert parts == pytest.approx(r.total_pnl, abs=0.03)
+
+
+def test_markets_resolved_row_counts_the_traded_markets_among_the_resolved_ones(
+    partial: BacktestResult, truncated: BacktestResult
+) -> None:
+    resolved_traded = sum(1 for m in partial.markets if m.resolved and m.traded)
+    # the all-markets traded count (what the row used to print) is a different number
+    assert partial.pairs.n_markets_traded == 4 != resolved_traded
+    pnl = section(format_report(partial), "Per-market PnL")
+    assert pnl["Markets resolved"] == f"2 of 4 ({resolved_traded} traded)"
+    assert (
+        pnl["Statistics cover"] == "resolved markets only (2 of 4); the PnL rows below cover all 4"
+    )
+    assert partial.pnl.n_markets_resolved_traded == resolved_traded
+    none = section(format_report(truncated), "Per-market PnL")
+    assert none["Markets resolved"] == "0 of 2 (0 traded)"
+    assert truncated.pairs.n_markets_traded == 2  # traded, but none of them resolved
+
+
+def test_a_fully_resolved_run_has_no_unrealised_part_and_no_scope_note() -> None:
+    cfg = replace(
+        BotConfig(), sim=replace(BotConfig().sim, n_windows=1, assets=("BTC",), window_seconds=300)
+    )
+    r = run_backtest(cfg, SyntheticFeed(cfg), source_label="synthetic:resolved")
+    assert r.unresolved_markets == []
+    assert r.pnl.pnl_unrealised == pytest.approx(0.0, abs=1e-6)
+    text = format_report(r)
+    pnl = section(text, "Per-market PnL")
+    assert pnl["Markets resolved"] == f"1 of 1 ({r.pairs.n_markets_traded} traded)"
+    assert "Statistics cover" not in pnl and "Of which unrealised" not in section(text, "Result")
+    rows = decomposition(r)
+    assert rows["unrealised"] == 0.0
+    assert rows["merge"] + rows["sell"] + rows["settle_pair"] + rows["settle_dir"] == (
+        pytest.approx(r.total_pnl, abs=0.03)
+    )
+
+
+def test_result_block_names_the_unrealised_part_of_total_pnl_for_open_markets() -> None:
+    pnl = replace(make_result().pnl, pnl_unrealised=-5.0)
+    open_run = make_result(unresolved_markets=["a", "b"], pnl=pnl)
+    row = section(format_report(open_run), "Result")["Of which unrealised"]
+    assert row == "-5.00  (open inventory of 2 unresolved markets, marked at the last mids)"
+    one = make_result(unresolved_markets=["a"], pnl=pnl)
+    assert "1 unresolved market," in section(format_report(one), "Result")["Of which unrealised"]
+    assert "Of which unrealised" not in section(format_report(make_result()), "Result")
+
+
+def test_invariants_row_says_which_invariants_ran_when_markets_are_unresolved(
+    truncated: BacktestResult,
+) -> None:
+    def label(**kw: object) -> str:
+        return section(format_report(make_result(**kw)), "Run")["Invariants"]
+
+    # DESIGN section 7: invariant 4 (everything settled, no open orders or reserved cash, the
+    # PnL breakdown sums to final equity) cannot hold or be checked while markets are open
+    two = "checked 1-3; 4 (final accounting) skipped: 2 unresolved markets"
+    assert label(unresolved_markets=["a", "b"]) == two
+    assert label(unresolved_markets=["a"]) == (
+        "checked 1-3; 4 (final accounting) skipped: 1 unresolved market"
+    )
+    assert label(unresolved_markets=["a"], invariants_checked=False) == "NOT checked"
+    assert label() == "checked (DESIGN section 7, 1-4)"
+    assert section(format_report(truncated), "Run")["Invariants"] == two
+
+
+def test_unresolved_markets_are_not_described_as_unhedged_at_resolution() -> None:
+    resolved = make_result()
+    pairs = section(format_report(resolved), "Pairing and inventory")
+    assert "Markets ending unhedged (>=1 share)" in pairs
+    assert "* unpaired inventory of at least 1 share remained at resolution\n" in (
+        format_report(resolved)
+    )
+    open_market = record(resolved=False, winner=None)
+    text = format_report(make_result(markets=[open_market], unresolved_markets=["m"]))
+    pairs = section(text, "Pairing and inventory")
+    assert "Markets ending unhedged (>=1 share)" not in pairs
+    assert pairs["Markets unhedged at close or stream end (>=1 share)"].startswith("1 of 1")
+    assert pairs["Pairs formed"] == "100.0 (merged 100, held at close or stream end 0.0)"
+    assert "Avg cost per pair held at close or stream end" in pairs
+    assert "(unresolved markets: at the end of the stream)" in text
+
+
+# --------------------------------------------------------------------------- caveats
+
+
+def test_paper_report_says_the_data_path_is_unverified_and_winners_are_inferred() -> None:
+    lines = format_report(make_result("paper-live")).splitlines()
+    assert lines[2] == PAPER_BANNER and lines[3] == PAPER_UNVERIFIED_NOTE
+    assert headline_banner("paper-live") == PAPER_BANNER + "\n" + PAPER_UNVERIFIED_NOTE
+    assert "UNVERIFIED" in PAPER_UNVERIFIED_NOTE and "INFERRED" in PAPER_UNVERIFIED_NOTE
+    text = format_report(make_result("paper-live"))
+    caveats = " ".join(text.split("\nCaveats\n-------\n")[1].split())
+    assert "winners are inferred from Binance/Coinbase spot" in caveats
+    assert "endpoints" in caveats and "never been checked" in caveats
+    # the data-path caveat belongs to paper sources only
+    for label in ("synthetic:unit", "replay: events.jsonl"):
+        other = format_report(make_result(label))
+        assert "UNVERIFIED" not in other and "inferred" not in other
+
+
+@pytest.mark.parametrize("label", ["synthetic:unit", "paper-live", "replay: events.jsonl"])
+def test_caveats_call_the_fee_parameters_placeholders_for_every_source(label: str) -> None:
+    text = format_report(make_result(label))
+    caveats = " ".join(text.split("\nCaveats\n-------\n")[1].split())
+    assert "Fee parameters are placeholders, not Polymarket's verified fee schedule" in caveats
+    assert "uncalibrated defaults" not in caveats
+    assert "model weights and strategy thresholds are uncalibrated" in caveats
 
 
 # --------------------------------------------------------------------------- run directory

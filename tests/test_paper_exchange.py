@@ -278,7 +278,8 @@ def test_reserved_cash_is_sum_of_buy_notional_including_in_flight() -> None:
     assert ex.balance() == 1000.0  # reservations are not deducted from cash
     assert all(not o.live for o in ex.open_orders())  # in flight orders reserve too
     assert ex.cancel(o1, 0.0)
-    assert ex.reserved_cash == approx(20.0)
+    assert ex.reserved_cash == approx(20.0)  # released at once for later orders (see below)
+    assert [o.order_id for o in ex.pending_cancels()] == [o1]  # although it is still at the venue
 
 
 def test_ioc_buy_in_flight_reserves_notional_only() -> None:
@@ -847,6 +848,99 @@ def test_ioc_activations_in_the_same_snapshot_share_depth_in_id_order() -> None:
     ]
 
 
+# The two books are mirrors of one liquidity pool (DESIGN 1): an UP ask at a is the DOWN bid at 1-a
+# with the same size, and an UP bid at b is the DOWN ask at 1-b. Depth taken by an IOC from one
+# book is therefore taken from the other too (matching-2).
+
+POOL: Book = {"bids": ((0.47, 100.0),), "asks": ((0.49, 100.0),)}  # DOWN: bid 0.51 / ask 0.53
+
+
+def _two_snapshots_with_both_tokens_held() -> PaperExchange:
+    """100 UP and 100 DOWN held; the exchange is on a fresh snapshot (full depth everywhere)."""
+    ex = PaperExchange(cfg_with())
+    ex.process(snap(0.0, **POOL))
+    buy_now(ex, UP, 100.0, 0.49)
+    buy_now(ex, DOWN, 100.0, 0.53)
+    ex.process(snap(1.0, **POOL))
+    return ex
+
+
+def test_buy_up_and_sell_down_at_the_mirrored_price_draw_on_one_pool() -> None:
+    # UP ask 0.49 x100 is the DOWN bid 0.51 x100: 100 shares between the two takers, not 200
+    ex = _two_snapshots_with_both_tokens_held()
+    submit_ok(ex, req(BUY, 0.49, 100.0, UP, IOC))
+    submit_ok(ex, req(SELL, 0.51, 100.0, DOWN, IOC))
+    fills = ex.drain_fills()
+    assert [(f.token, f.side, f.price, f.size) for f in fills] == [
+        (UP, BUY, 0.49, pytest.approx(100.0))
+    ]
+    assert ex.position(M1, UP) == approx(200.0) and ex.position(M1, DOWN) == approx(100.0)
+
+
+def test_sell_down_first_leaves_nothing_for_buy_up() -> None:
+    ex = _two_snapshots_with_both_tokens_held()
+    submit_ok(ex, req(SELL, 0.51, 100.0, DOWN, IOC))
+    submit_ok(ex, req(BUY, 0.49, 100.0, UP, IOC))
+    assert [(f.token, f.size) for f in ex.drain_fills()] == [(DOWN, pytest.approx(100.0))]
+
+
+def test_sell_up_and_buy_down_at_the_mirrored_price_draw_on_one_pool() -> None:
+    # UP bid 0.47 x100 is the DOWN ask 0.53 x100
+    ex = _two_snapshots_with_both_tokens_held()
+    submit_ok(ex, req(SELL, 0.47, 100.0, UP, IOC))
+    submit_ok(ex, req(BUY, 0.53, 100.0, DOWN, IOC))
+    assert [(f.token, f.side, f.size) for f in ex.drain_fills()] == [
+        (UP, SELL, pytest.approx(100.0))
+    ]
+
+
+def test_mirrored_takers_share_what_is_left_of_the_pool() -> None:
+    ex = _two_snapshots_with_both_tokens_held()
+    submit_ok(ex, req(BUY, 0.49, 60.0, UP, IOC))
+    submit_ok(ex, req(SELL, 0.51, 100.0, DOWN, IOC))  # 100 - 60 = 40 left in the pool
+    assert [(f.token, f.size) for f in ex.drain_fills()] == [
+        (UP, pytest.approx(60.0)),
+        (DOWN, pytest.approx(40.0)),
+    ]
+    ex.process(snap(2.0, **POOL))  # a fresh snapshot: the whole pool is back
+    submit_ok(ex, req(SELL, 0.51, 60.0, DOWN, IOC))  # the 60 DOWN still held
+    assert [f.size for f in ex.drain_fills()] == [pytest.approx(60.0)]
+
+
+def test_the_two_sides_of_the_pool_and_other_levels_stay_independent() -> None:
+    ex = PaperExchange(cfg_with())
+    book: Book = {"bids": ((0.47, 100.0), (0.46, 100.0)), "asks": ((0.49, 100.0), (0.50, 100.0))}
+    ex.process(snap(0.0, **book))  # DOWN: bids 0.51 / 0.50, asks 0.53 / 0.54
+    buy_now(ex, DOWN, 200.0, 0.54)
+    ex.process(snap(1.0, **book))
+    # BUY UP (UP ask pool) and BUY DOWN (UP bid pool) are different liquidity: both get 100 ...
+    submit_ok(ex, req(BUY, 0.49, 100.0, UP, IOC))
+    submit_ok(ex, req(BUY, 0.53, 100.0, DOWN, IOC))
+    assert [(f.token, f.size) for f in ex.drain_fills()] == [
+        (UP, pytest.approx(100.0)),
+        (DOWN, pytest.approx(100.0)),
+    ]
+    # ... and the exhausted 0.51 pool does not hide the 0.50 DOWN bid (the UP ask at 0.50)
+    submit_ok(ex, req(SELL, 0.50, 150.0, DOWN, IOC))
+    fills = ex.drain_fills()
+    assert [(f.price, f.size) for f in fills] == [(0.50, pytest.approx(100.0))]  # 0.51 is gone
+
+
+def test_mirrored_ioc_activations_in_one_snapshot_share_depth_in_id_order() -> None:
+    ex = PaperExchange(cfg_with(latency=1))
+    ex.process(snap(0.0, **POOL))
+    submit_ok(ex, req(BUY, 0.53, 100.0, DOWN, IOC))
+    ex.process(snap(1.0, **POOL))  # 100 DOWN bought (from the UP bid pool)
+    assert ex.position(M1, DOWN) == approx(100.0)
+    a = submit_ok(ex, req(BUY, 0.49, 70.0, UP, IOC))
+    b = submit_ok(ex, req(SELL, 0.51, 70.0, DOWN, IOC))
+    fills = ex.process(snap(2.0, **POOL))
+    assert [(f.order_id, f.size) for f in fills] == [
+        (a, pytest.approx(70.0)),
+        (b, pytest.approx(30.0)),
+    ]
+
+
 def test_ioc_slippage_is_charged_but_capped_by_the_limit() -> None:
     # 2 ticks of slippage = 0.02
     ex = PaperExchange(cfg_with(slip=2))
@@ -906,17 +1000,269 @@ def test_ioc_buy_cash_check_excludes_the_cash_other_bids_committed() -> None:
 
 
 def test_cancel_semantics() -> None:
+    # latency 0: a cancel reaches the venue at once, so it is instant (nothing can be in flight)
+    ex = PaperExchange(cfg_with(latency=0))
+    ex.process(snap(0.0))
+    oid = submit_ok(ex, req(BUY, 0.47, 50.0))
+    assert ex.cancel(oid, 0.0) is True
+    assert ex.stats["cancelled"] == 1
+    assert ex.cancel(oid, 0.0) is False  # already gone
+    assert ex.cancel("o999", 0.0) is False  # unknown
+    assert ex.open_orders() == [] and ex.pending_cancels() == [] and ex.reserved_cash == 0.0
+    # a cancelled order never fills
+    assert ex.process(snap(1.0, trades=(tr(1.0, UP, 0.45, 100.0, SELL),))) == []
+
+
+# --------------------------------------------------------------------------- cancel latency
+#
+# A cancel is a message to the venue like an order, so it needs ``latency_ticks`` snapshots of the
+# order's market to land (DESIGN 5). Until then the order stays matchable, keeps its reservation
+# and is hidden from ``open_orders`` (the engine already dropped it and must not cancel it again).
+# Before this was modelled, ``cancel`` popped the order at once: a stale quote could never be hit
+# by a print that arrived after the engine decided to drop it, which flattered backtest PnL.
+
+
+def _live_bid(
+    latency: int, *, size: float = 100.0, cash: float = INITIAL
+) -> tuple[PaperExchange, str, float]:
+    """A live UP bid at 0.47 (inside the 0.46/0.52 spread: no queue) and the clock (its ts)."""
+    ex = PaperExchange(cfg_with(latency=latency, cash=cash))
+    t = 0.0
+    ex.process(snap(t))  # snapshot count 1
+    oid = submit_ok(ex, req(BUY, 0.47, size))  # live at count 1 + latency
+    for _ in range(latency):
+        t += 1.0
+        ex.process(snap(t))
+    assert [o.live for o in ex.open_orders()] == [True]
+    return ex, oid, t
+
+
+def _sell_print(t: float, size: float, price: float = 0.40) -> MarketSnapshot:
+    """A snapshot whose only print sells ``size`` UP at ``price`` (through our 0.47 bid)."""
+    return snap(t, trades=(tr(t, UP, price, size, SELL),))
+
+
+def test_an_order_cancelled_after_it_went_live_can_still_be_hit_before_the_cancel_lands() -> None:
+    # matching-1: live at ts 1, cancel sent right after that snapshot, a through-print (7 ticks
+    # below our bid) in the very next snapshot. Without the cancel it fills; with a cancel that
+    # needs one snapshot to land it must fill too (the print is older than the cancel's arrival).
+    ref, _, t = _live_bid(1)
+    assert [(f.price, f.size) for f in ref.process(_sell_print(t + 1, 500.0))] == [(0.47, 100.0)]
+    ex, oid, t = _live_bid(1)
+    assert ex.cancel(oid, t) is True
+    fills = ex.process(_sell_print(t + 1, 500.0))
+    assert [(f.order_id, f.price, f.size) for f in fills] == [(oid, 0.47, pytest.approx(100.0))]
+    assert ex.position(M1, UP) == approx(100.0)
+    assert ex.balance() == approx(INITIAL - 47.0)
+
+
+@pytest.mark.parametrize("latency", [1, 2, 3])
+def test_a_cancel_lands_after_latency_ticks_snapshots_and_earlier_prints_still_fill(
+    latency: int,
+) -> None:
+    ex, oid, t = _live_bid(latency)
+    assert ex.cancel(oid, t) is True
+    assert ex.open_orders() == []  # hidden from the engine ...
+    for _ in range(latency):
+        assert [o.order_id for o in ex.pending_cancels()] == [oid]
+        assert (
+            ex.reserved_cash == 0.0
+        )  # ... and reserving nothing (funds are free for what follows)
+        t += 1.0
+        fills = ex.process(_sell_print(t, 10.0))
+        assert [f.size for f in fills] == [pytest.approx(10.0)]  # still matchable
+    # the cancel landed once the latency-th snapshot's prints were matched
+    assert ex.pending_cancels() == [] and ex.open_orders() == [] and ex.reserved_cash == 0.0
+    assert ex.stats["cancelled"] == 1 and ex.stats["cancel_too_late"] == 0
+    t += 1.0
+    assert ex.process(_sell_print(t, 10.0)) == []  # gone
+    assert ex.position(M1, UP) == approx(10.0 * latency)
+
+
+def test_a_replacement_sent_behind_a_cancel_can_use_the_cash_of_the_cancelled_order() -> None:
+    # the cancel reaches the venue before the order sent after it, so its 47 USDC are free again
+    ex, oid, t = _live_bid(2, cash=60.0)  # 0.47 * 100 = 47 of 60
+    assert ex.cancel(oid, t) is True
+    assert ex.reserved_cash == 0.0 and ex.open_orders() == []
+    assert [o.order_id for o in ex.pending_cancels()] == [oid]  # still open at the venue
+    res = ex.submit(
+        req(BUY, 0.50, 100.0), t
+    )  # needs 50 of 60 (it would be refused if 47 were held)
+    assert res.ok and ex.reserved_cash == approx(50.0)
+    too_much = ex.submit(req(BUY, 0.50, 25.0), t)  # 50 + 12.5 > 60
+    assert (too_much.ok, too_much.reason) == (False, "insufficient_cash")
+
+
+def test_a_fill_of_a_pending_cancel_is_capped_to_the_cash_the_replacement_holds() -> None:
+    ex, oid, t = _live_bid(2, cash=60.0)
+    assert ex.cancel(oid, t) is True
+    assert ex.submit(req(BUY, 0.50, 100.0), t).ok  # holds 50 of the 60
+    # a through-print would fill all 100 of the stale bid (47 USDC), but only 10 USDC are left
+    fills = ex.process(_sell_print(t + 1.0, 500.0))
+    assert [(f.order_id, f.price, f.size) for f in fills] == [
+        (oid, 0.47, pytest.approx(10.0 / 0.47))
+    ]
+    assert ex.balance() == approx(50.0)  # exactly what the replacement holds
+    assert ex.balance() - ex.reserved_cash >= -1e-9
+    ex.process(snap(t + 2.0))  # the cancel lands; the replacement goes live
+    assert ex.pending_cancels() == [] and ex.reserved_cash == approx(50.0)
+    assert ex.stats["cancelled"] == 1
+
+
+def test_a_fill_of_a_pending_cancel_is_not_capped_when_cash_is_ample() -> None:
+    ex, oid, t = _live_bid(2, cash=1_000.0)
+    assert ex.cancel(oid, t) is True
+    assert ex.submit(req(BUY, 0.50, 100.0), t).ok
+    fills = ex.process(_sell_print(t + 1.0, 500.0))
+    assert [(f.order_id, f.size) for f in fills] == [(oid, pytest.approx(100.0))]
+
+
+def test_a_pending_cancel_with_a_maker_fee_is_capped_with_the_fee_included() -> None:
+    ex = PaperExchange(cfg_with(latency=2, cash=60.0, maker_fee=0.01))
+    ex.process(snap(0.0))
+    oid = submit_ok(ex, req(BUY, 0.47, 100.0))  # needs 47 + 0.47 fee
+    ex.process(snap(1.0))
+    ex.process(snap(2.0))
+    assert ex.cancel(oid, 2.0) is True
+    assert ex.submit(req(BUY, 0.50, 100.0), 2.0).ok  # commits 50 + 0.5 of the 60
+    fills = ex.process(_sell_print(3.0, 500.0))
+    # 60 - 50.5 = 9.5 USDC free: 9.5 / (0.47 * 1.01) shares, paying their fee too
+    assert [f.size for f in fills] == [pytest.approx(9.5 / (0.47 * 1.01))]
+    assert ex.balance() == approx(50.5)
+
+
+def test_the_position_of_a_pending_sell_is_free_for_later_orders_and_its_fill_is_capped() -> None:
+    ex = PaperExchange(cfg_with(latency=1))
+    ex.process(snap(0.0, asks=((0.50, 300.0),)))
+    submit_ok(ex, req(BUY, 0.50, 100.0, UP, IOC))
+    ex.process(snap(1.0, asks=((0.50, 300.0),)))  # the IOC executes: 100 UP held
+    assert ex.position(M1, UP) == approx(100.0)
+    old = submit_ok(ex, req(SELL, 0.60, 100.0), 1.0)  # a resting ask, live at the next snapshot
+    ex.process(snap(2.0))
+    assert ex.cancel(old, 2.0) is True  # lands one snapshot later
+    assert ex.merge(M1, 5.0, 2.0) is None  # no DOWN to merge, but not for lack of free UP
+    assert ex.submit(req(SELL, 0.60, 60.0), 2.0).ok  # sent behind the cancel: 100 UP are free
+    # a BUY print at 0.65 would lift all 100 of the stale ask, but only 40 shares are not
+    # reserved by the replacement
+    fills = ex.process(snap(3.0, trades=(tr(3.0, UP, 0.65, 500.0, BUY),)))
+    assert [(f.order_id, f.side, f.size) for f in fills] == [(old, SELL, pytest.approx(40.0))]
+    assert ex.position(M1, UP) == approx(60.0)
+
+
+def test_a_second_cancel_of_a_pending_cancel_is_refused() -> None:
+    ex, oid, t = _live_bid(2)
+    assert ex.cancel(oid, t) is True
+    assert ex.cancel(oid, t) is False  # already pending: not a second request
+    ex.process(snap(t + 1.0))
+    assert ex.cancel(oid, t + 1.0) is False
+    ex.process(snap(t + 2.0))
+    assert ex.stats["cancelled"] == 1 and ex.stats["cancel_too_late"] == 0
+    assert ex.cancel(oid, t + 2.0) is False  # gone
+
+
+def test_a_cancel_that_arrives_after_the_order_was_filled_is_counted_too_late() -> None:
+    ex, oid, t = _live_bid(2)
+    assert ex.cancel(oid, t) is True
+    fills = ex.process(_sell_print(t + 1.0, 500.0))  # fills all 100 before the cancel lands
+    assert sum(f.size for f in fills) == approx(100.0)
+    assert ex.reserved_cash == 0.0 and ex.pending_cancels() == []  # nothing left to cancel
+    assert ex.stats["cancelled"] == 0 and ex.stats["cancel_too_late"] == 0  # not landed yet
+    ex.process(snap(t + 2.0))
+    assert ex.stats["cancelled"] == 0 and ex.stats["cancel_too_late"] == 1
+    assert ex.position(M1, UP) == approx(100.0)
+
+
+def test_a_partly_filled_order_is_cancelled_for_its_remainder() -> None:
+    ex, oid, t = _live_bid(1)
+    assert ex.cancel(oid, t) is True
+    assert [f.size for f in ex.process(_sell_print(t + 1.0, 30.0))] == [pytest.approx(30.0)]
+    assert ex.pending_cancels() == [] and ex.reserved_cash == 0.0  # the remaining 70 are released
+    assert ex.stats["cancelled"] == 1
+    assert ex.balance() == approx(INITIAL - 0.47 * 30.0)
+
+
+def test_cancelling_an_in_flight_order_cannot_overtake_it() -> None:
+    # latency 2: submitted at count 1 it goes live at count 3; a cancel sent at count 2 lands at
+    # count 4, so the order is live (and hittable) for the prints of snapshot 4
+    ex = PaperExchange(cfg_with(latency=2))
+    ex.process(snap(0.0))
+    oid = submit_ok(ex, req(BUY, 0.47, 100.0))
+    ex.process(snap(1.0))
+    assert [o.live for o in ex.open_orders()] == [False]
+    assert ex.cancel(oid, 1.0) is True
+    assert ex.open_orders() == [] and ex.reserved_cash == 0.0
+    assert ex.process(_sell_print(2.0, 500.0)) == []  # activates here; this print is too early
+    fills = ex.process(_sell_print(3.0, 500.0))
+    assert [(f.price, f.size) for f in fills] == [(0.47, pytest.approx(100.0))]
+
+
+def test_a_cancel_sent_with_the_order_lands_just_as_it_activates() -> None:
     ex = PaperExchange(cfg_with(latency=1))
     ex.process(snap(0.0))
-    live_id = submit_ok(ex, req(BUY, 0.47, 50.0))
-    assert ex.cancel(live_id, 0.0) is True  # in flight orders can be cancelled
+    oid = submit_ok(ex, req(BUY, 0.47, 50.0))
+    assert ex.cancel(oid, 0.0) is True
+    assert ex.open_orders() == [] and ex.reserved_cash == 0.0
+    # the order activates and its cancel lands in snapshot 2, before it could meet a print
+    assert ex.process(_sell_print(1.0, 100.0, 0.45)) == []
+    assert ex.pending_cancels() == [] and ex.reserved_cash == 0.0
     assert ex.stats["cancelled"] == 1
-    assert ex.cancel(live_id, 0.0) is False  # already gone
-    assert ex.cancel("o999", 0.0) is False  # unknown
-    assert ex.reserved_cash == 0.0
-    # a cancelled in-flight order never activates or fills
-    assert ex.process(snap(1.0, trades=(tr(1.0, UP, 0.45, 100.0, SELL),))) == []
-    assert ex.process(snap(2.0, trades=(tr(2.0, UP, 0.45, 100.0, SELL),))) == []
+    assert ex.process(_sell_print(2.0, 100.0, 0.45)) == []
+
+
+def test_a_cancel_cannot_stop_an_ioc_already_on_its_way() -> None:
+    # the cancel is sent after the IOC, so it reaches the venue after it: the IOC executes first
+    ex = PaperExchange(cfg_with(latency=1))
+    ex.process(snap(0.0, asks=((0.50, 100.0),)))
+    oid = submit_ok(ex, req(BUY, 0.52, 10.0, UP, IOC))
+    assert ex.cancel(oid, 0.0) is True
+    fills = ex.process(snap(1.0, asks=((0.50, 100.0),)))
+    assert [(f.order_id, f.size) for f in fills] == [(oid, pytest.approx(10.0))]
+    assert ex.stats["cancelled"] == 0 and ex.stats["cancel_too_late"] == 1
+
+
+def test_a_post_only_cancelled_at_activation_leaves_its_cancel_too_late() -> None:
+    ex = PaperExchange(cfg_with(latency=1))
+    ex.process(snap(0.0))
+    oid = submit_ok(ex, req(BUY, 0.47, 50.0))
+    assert ex.cancel(oid, 0.0) is True
+    ex.process(snap(1.0, asks=((0.47, 100.0),)))  # our 0.47 bid crosses the ask at activation
+    assert ex.stats["post_only_cancels"] == 1
+    assert ex.stats["cancelled"] == 0 and ex.stats["cancel_too_late"] == 1
+    assert ex.open_orders() == [] and ex.pending_cancels() == [] and ex.reserved_cash == 0.0
+
+
+def test_cancel_latency_counts_snapshots_of_the_orders_own_market() -> None:
+    ex = PaperExchange(cfg_with(latency=1))
+    ex.process(snap(0.0, mid=M1))
+    ex.process(snap(0.0, mid=M2))
+    oid = submit_ok(ex, req(BUY, 0.47, 100.0, mid=M1))
+    ex.process(snap(1.0, mid=M1))  # live
+    assert ex.cancel(oid, 1.0) is True
+    ex.process(snap(1.0, mid=M2))
+    ex.process(snap(2.0, mid=M2))  # another market's snapshots do not land it
+    assert [o.order_id for o in ex.pending_cancels(M1)] == [oid] and ex.pending_cancels(M2) == []
+    fills = ex.process(snap(2.0, mid=M1, trades=(tr(2.0, UP, 0.40, 500.0, SELL),)))
+    assert [(f.order_id, f.size) for f in fills] == [(oid, pytest.approx(100.0))]
+
+
+def test_settle_discards_pending_cancels() -> None:
+    ex, oid, t = _live_bid(2)
+    assert ex.cancel(oid, t) is True
+    ex.settle(M1, UP, 900.0)
+    assert ex.pending_cancels() == [] and ex.open_orders() == [] and ex.reserved_cash == 0.0
+    assert ex.stats["cancelled"] == 0 and ex.stats["cancel_too_late"] == 0
+
+
+def test_pending_cancels_are_copies_sorted_by_numeric_id() -> None:
+    ex = PaperExchange(cfg_with(latency=1))
+    ex.process(snap(0.0))
+    ids = [submit_ok(ex, req(BUY, 0.40 + 0.01 * i, 5.0)) for i in range(11)]
+    ex.process(snap(1.0))
+    for oid in reversed(ids):
+        assert ex.cancel(oid, 1.0) is True
+    assert [o.order_id for o in ex.pending_cancels()] == [f"o{i}" for i in range(1, 12)]
+    ex.pending_cancels()[0].remaining = 0.0
+    assert ex.pending_cancels()[0].remaining == 5.0
 
 
 def test_cancel_of_a_filled_order_returns_false_and_partial_can_be_cancelled() -> None:
@@ -1255,6 +1601,8 @@ def _random_request(rng: random.Random, mid: str, center: int) -> OrderRequest:
 
 def _check_state(ex: PaperExchange, pf: Portfolio, markets: tuple[str, ...]) -> None:
     orders = ex.open_orders()
+    # a pending cancel is hidden from open_orders and no longer reserves anything
+    assert {o.order_id for o in ex.pending_cancels()}.isdisjoint(o.order_id for o in orders)
     # reserved_cash == sum of BUY price * remaining, at all times
     assert ex.reserved_cash == approx(
         sum(o.price * o.remaining for o in orders if o.side is BUY), 1e-9
@@ -1363,6 +1711,8 @@ def test_random_walk_preserves_exchange_invariants(
             open_ids = [o.order_id for o in ex.open_orders()]
             if open_ids:
                 assert ex.cancel(rng.choice(open_ids), clock[m])
+            for pending in ex.pending_cancels():  # a cancel already on its way cannot be repeated
+                assert ex.cancel(pending.order_id, clock[m]) is False
         else:
             size = float(rng.choice([1, 5, 10, 25, 50]))
             merged = ex.merge(m, size, clock[m])
@@ -1381,7 +1731,7 @@ def test_random_walk_preserves_exchange_invariants(
     for m in markets:
         s = ex.settle(m, rng.choice([UP, DOWN]), 900.0)
         total += pf.apply_settlement(s).total
-    assert ex.open_orders() == [] and ex.reserved_cash == 0.0
+    assert ex.open_orders() == [] and ex.pending_cancels() == [] and ex.reserved_cash == 0.0
     assert all(ex.position(m, t) == 0.0 for m in markets for t in Outcome)
     assert ex.balance() == approx(pf.cash, 1e-6)
     assert total == approx(ex.balance() - cash0, 1e-6)  # DESIGN invariant 4 (exchange side)

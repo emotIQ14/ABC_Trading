@@ -28,7 +28,9 @@ Invariants (``check_invariants=True``; ``InvariantError`` with a precise message
     4. At the end every market is resolved, no open orders remain, positions are zero and
        ``sum(PnLBreakdown.total) == final equity - initial cash``. A stream that ends with
        unresolved markets violates this unless ``allow_unresolved=True`` (paper mode); those markets
-       are then reported with ``resolved=False`` and marked at the last snapshot mids.
+       are then reported with ``resolved=False`` and marked at the last snapshot mids. Invariant 4
+       is NOT checked for such a run (only that no order rests in a resolved market), so the report
+       says "1-3 checked" there, not "1-4".
 A ``ValueError`` raised by the engine's portfolio when it is handed an exchange fill / merge /
 settlement is reported as an invariant-1 violation (the two disagree), and an ``AssertionError``
 from a component's own internal check is wrapped into ``InvariantError`` as well.
@@ -41,6 +43,14 @@ Metrics
   sampled curve (use ``equity_sample_every=1`` for event-granular drawdown).
 * Per-market PnL is ``PnLBreakdown.total``; ``sharpe_like = mean / std * sqrt(n)`` over resolved
   markets (sample std; a t-statistic, not an annualised Sharpe ratio).
+* Two populations, kept apart on purpose. The per-market statistics of ``PnLStats`` (mean, std,
+  ``sharpe_like``, best / worst, win rate) cover the RESOLVED markets only: an unresolved market's
+  pnl is just what it realised so far. The decomposition sums (``pnl_sell``, ``pnl_merge``, the
+  two settlement rows, ``fees_paid``) cover EVERY market (an unresolved market contributes its
+  realised sell and merge pnl and no settlement pnl), and ``pnl_unrealised`` is what is left of
+  ``total_pnl``: open inventory marked at the last mids minus its cost. So the five pnl rows always
+  add up to ``total_pnl``, also for a paper run or a truncated replay (all of it is realised and
+  ``pnl_unrealised`` is zero when every market resolved).
 * Pairing: ``pairs_formed = merged pairs + pairs held at close``; ``pair_completion_rate =
   2 * pairs_formed / shares bought`` (share of bought shares that ended in a pair); a market
   ``ended_unhedged`` iff at least ``DUST_SHARES`` (1.0) unpaired shares remained at resolution
@@ -178,18 +188,24 @@ class PairStats:
 
 @dataclass(frozen=True, slots=True)
 class PnLStats:
+    """Per-market statistics (RESOLVED markets only) and the pnl decomposition (ALL markets)."""
+
     n_markets_resolved: int
+    n_markets_resolved_traded: int  # resolved markets with at least one fill
+    # per-market statistics: resolved markets only
     mean_market_pnl: float
     std_market_pnl: float
     sharpe_like: float
     best_market_pnl: float
     worst_market_pnl: float
     win_rate_traded: float | None  # share of resolved traded markets with pnl > 0
-    pnl_sell: float
-    pnl_merge: float
-    pnl_settle_pair: float
-    pnl_settle_directional: float
-    fees_paid: float
+    # decomposition of ``BacktestResult.total_pnl``: every market, resolved or not
+    pnl_sell: float  # realised on sells
+    pnl_merge: float  # realised on merges
+    pnl_settle_pair: float  # resolved markets only (an open market has not settled)
+    pnl_settle_directional: float  # resolved markets only
+    pnl_unrealised: float  # final equity - initial cash - the four rows above (open inventory)
+    fees_paid: float  # every fill's fee; inside the rows above and the open inventory's cost
     peak_equity: float
     max_drawdown_usd: float
     max_drawdown_frac: float
@@ -327,25 +343,42 @@ def pair_stats(records: Sequence[MarketRecord]) -> PairStats:
     )
 
 
-def pnl_stats(records: Sequence[MarketRecord], equity: Sequence[float], initial: float) -> PnLStats:
-    """Per-market PnL statistics (resolved markets) and drawdown of the sampled equity curve."""
+def pnl_stats(
+    records: Sequence[MarketRecord],
+    equity: Sequence[float],
+    initial: float,
+    *,
+    final_equity: float | None = None,
+) -> PnLStats:
+    """Per-market PnL statistics and the PnL decomposition, plus the sampled-curve drawdown.
+
+    The statistics (mean, std, Sharpe-like, best / worst, win rate) use the resolved markets only.
+    The decomposition sums use every record: an unresolved market has realised sell and merge pnl
+    (and fees) but no settlement pnl, and ``pnl_unrealised`` is the remainder of the total gain,
+    ``final_equity - initial - sum(record pnl)``, i.e. open inventory marked at mid minus its
+    cost. ``final_equity`` defaults to the last point of ``equity`` (``initial`` without a curve).
+    """
     resolved = [r for r in records if r.resolved]
     pnls = [r.pnl for r in resolved]
     traded = [r for r in resolved if r.traded]
     dd = metrics.max_drawdown(equity) if equity else metrics.Drawdown(0.0, 0.0, 0, 0)
+    if final_equity is None:
+        final_equity = equity[-1] if equity else initial
     return PnLStats(
         n_markets_resolved=len(resolved),
+        n_markets_resolved_traded=len(traded),
         mean_market_pnl=metrics.mean(pnls) if pnls else 0.0,
         std_market_pnl=metrics.std(pnls) if len(pnls) >= 2 else 0.0,
         sharpe_like=metrics.sharpe_like(pnls),
         best_market_pnl=max(pnls, default=0.0),
         worst_market_pnl=min(pnls, default=0.0),
         win_rate_traded=metrics.ratio(sum(1 for r in traded if r.pnl > 0.0), len(traded)),
-        pnl_sell=math.fsum(r.sell_pnl for r in resolved),
-        pnl_merge=math.fsum(r.merge_pnl for r in resolved),
-        pnl_settle_pair=math.fsum(r.settle_pair_pnl for r in resolved),
-        pnl_settle_directional=math.fsum(r.settle_directional_pnl for r in resolved),
-        fees_paid=math.fsum(r.fees_paid for r in resolved),
+        pnl_sell=math.fsum(r.sell_pnl for r in records),
+        pnl_merge=math.fsum(r.merge_pnl for r in records),
+        pnl_settle_pair=math.fsum(r.settle_pair_pnl for r in records),
+        pnl_settle_directional=math.fsum(r.settle_directional_pnl for r in records),
+        pnl_unrealised=final_equity - initial - math.fsum(r.pnl for r in records),
+        fees_paid=math.fsum(r.fees_paid for r in records),
         peak_equity=max(equity, default=initial),
         max_drawdown_usd=dd.depth,
         max_drawdown_frac=dd.fraction,
@@ -887,7 +920,9 @@ class BacktestRunner:
             kill_switch=self.engine.risk.kill_switch,
             activity=activity_stats(self._fills),
             pairs=pair_stats(records),
-            pnl=pnl_stats(records, [p.equity for p in curve], self._initial),
+            pnl=pnl_stats(
+                records, [p.equity for p in curve], self._initial, final_equity=final_equity
+            ),
             calibration=calibration_stats(samples),
             unresolved_markets=list(unresolved),
             markets=records,

@@ -33,7 +33,10 @@ Behaviour
   counted in ``stats``; the window state survives, so the next tick retries. A pending
   resolution simply waits for the next successful spot reading. A trades failure does NOT skip
   the tick (trades are best effort; the snapshot is emitted without new prints and the missed
-  ones are retried next tick). Anything that is not a ``DataError`` propagates.
+  ones are retried next tick). A single malformed trade record never gets this far: the client
+  skips and counts it (``PolymarketPublicClient.stats``, not ``LiveFeed.stats``). Anything that
+  is not a ``DataError`` propagates (the clients promise to raise nothing else for a bad
+  response, so it would be a bug).
 * Events are emitted in non-decreasing ``ts``: resolutions (``ts`` = max(window end, last
   event ts)) before the tick's snapshots; a backwards-moving ``clock`` is clamped to the last
   event ts. ``MarketResolved`` is emitted exactly once per window and only for windows that

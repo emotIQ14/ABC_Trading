@@ -30,7 +30,9 @@ from abc_trading.config import (
     TimingConfig,
 )
 from abc_trading.model.fair_value import FairValue
+from abc_trading.strategy.directional import directional_target
 from abc_trading.strategy.engine import MarketMakerEngine
+from abc_trading.strategy.quoter import floor_size
 from abc_trading.types import (
     EPS,
     Action,
@@ -62,6 +64,7 @@ NO_DIRECTIONAL = replace(CFG, directional=DirectionalConfig(enabled=False))
 ACC_TS = 1030.0  # a normal ACCUMULATE timestamp
 WD_TS = 1820.0  # WIND_DOWN (left = 80)
 FL_TS = 1880.0  # FLATTEN (left = 20)
+RAW_MODEL_OFFSET = 0.04  # StubModel: p_up_model = p_up + this (the raw, unshrunk probability)
 
 
 # --------------------------------------------------------------------------- harness
@@ -79,7 +82,11 @@ class StubModel:
         self.observed.append((asset, ts, spot))
 
     def estimate(self, snap: MarketSnapshot) -> FairValue:
-        return FairValue(self.p_up, self.p_up, 0.0, 0.0, 1e-4, 800.0, 0.0, 0.0, 0.0, self.valid)
+        # p_up is the (shrunk) probability the strategy must use; p_up_model is the raw model
+        # output and deliberately differs from it, so a mark or a quote that read the wrong one
+        # of the two would show in the numbers of every test.
+        raw = min(0.999, self.p_up + RAW_MODEL_OFFSET)
+        return FairValue(self.p_up, raw, 0.0, 0.0, 1e-4, 800.0, 0.0, 0.0, 0.0, self.valid)
 
 
 def mkbook(
@@ -128,6 +135,16 @@ class FakeExchange:
     def reserved(self, market_id: str | None = None) -> float:
         return sum(o.price * o.remaining for o in self.open_orders(market_id) if o.side is BUY)
 
+    def committed(self, market_id: str | None = None) -> float:
+        """Cash the open BUYs claim, as ``PaperExchange._commitment``: ``price * remaining`` plus
+        the maker fee of a resting (POST_ONLY) bid when it is positive."""
+        fees = self.engine.fees
+        return self.reserved(market_id) + sum(
+            max(0.0, fees.fee(o.price, o.remaining, True))
+            for o in self.open_orders(market_id)
+            if o.side is BUY and o.tif is POST
+        )
+
     def execute_in_flight_iocs(self, ts: float) -> None:
         """Execute (and remove) every in-flight IOC order at its limit price."""
         for oid in [oid for oid, o in self.orders.items() if o.tif is IOC]:
@@ -171,7 +188,9 @@ class FakeExchange:
             need = req.price * req.size
             if req.tif is IOC:
                 need += fees.fee(req.price, req.size, False)
-            if need > self.engine.portfolio.cash - self.reserved() + 1e-9:
+            else:
+                need += max(0.0, fees.fee(req.price, req.size, True))
+            if need > self.engine.portfolio.cash - self.committed() + 1e-9:
                 return reject("cash")
             if req.tif is POST:
                 if book.best_ask is None or req.price >= book.best_ask - EPS:
@@ -530,6 +549,49 @@ def test_flatten_does_not_resend_a_pending_ioc_sell() -> None:
     assert actions == []  # the 40 shares are already being sold
 
 
+@pytest.mark.parametrize("limit", [1, 2])
+def test_flatten_sells_respect_the_order_rate_limit(limit: int) -> None:
+    # Three markets enter FLATTEN in the same second, each holding 50 unpaired UP that the model
+    # does not back (p 0.50: exit 0.49 - fee, margin 0.0176 < hold_margin 0.02), so each wants an
+    # IOC sell. Only `limit` of them go out; the rest are counted as rate limited and are not sent
+    # (DESIGN 2.7: the limiter covers every order the engine sends, and each sell uses one slot).
+    cfg = replace(CFG, risk=RiskConfig(max_orders_per_second=float(limit)))
+    engine, _, _ = make_env(cfg)
+    markets = [MarketSpec(f"m{i}", "BTC", start_ts=1000.0, end_ts=1900.0) for i in range(3)]
+    for m in markets:
+        give(engine, up=50, market=m.market_id)
+    sent = [places(engine.on_snapshot(mksnap(FL_TS, market=m), [])) for m in markets]
+    assert [len(reqs) for reqs in sent] == [1] * limit + [0] * (3 - limit)
+    assert all(r.side is SELL and r.tif is IOC and r.size == 50.0 for reqs in sent for r in reqs)
+    assert engine.stats["flatten_sells"] == limit
+    assert engine.stats["orders_rate_limited"] == 3 - limit
+    # The refused sells are not forgotten: a second later the window is empty again and the
+    # markets that were refused sell (the one that would exceed the limit again waits).
+    refused = markets[limit:]
+    later = [places(engine.on_snapshot(mksnap(FL_TS + 1.0, market=m), [])) for m in refused]
+    resent = min(limit, len(refused))
+    assert [len(reqs) for reqs in later] == [1] * resent + [0] * (len(refused) - resent)
+    assert engine.stats["flatten_sells"] == limit + resent
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        # Only a SELL that is still in flight counts as shares already being sold ...
+        OpenOrder("ox", "cx", "m1", UP, BUY, 0.51, 40.0, 40.0, IOC, FL_TS, live=False),
+        # ... not an IOC BUY, and not a sell of the other token.
+        OpenOrder("ox", "cx", "m1", DOWN, SELL, 0.49, 40.0, 40.0, IOC, FL_TS, live=False),
+    ],
+)
+def test_flatten_sells_despite_an_in_flight_order_that_sells_nothing_of_the_heavy_token(
+    order: OpenOrder,
+) -> None:
+    engine, _, _ = make_env(p_up=0.5)
+    give(engine, up=40)
+    actions = engine.on_snapshot(mksnap(FL_TS), [order])
+    assert [(r.token, r.side, r.size) for r in places(actions)] == [(UP, SELL, 40.0)]
+
+
 def test_done_phase_only_cancels_stragglers() -> None:
     engine, _, ex = make_env()
     give(engine, up=100, down=100)
@@ -550,6 +612,7 @@ def test_kill_switch_latches_cancels_everything_and_stops_quoting() -> None:
     give(engine, up=1000, up_px=0.5)  # cost 500, marked at p_up 0.5 -> equity unchanged
     ex.step(mksnap(ACC_TS + 1))
     assert not engine.risk.kill_switch
+    assert engine.stats["risk_trips_kill_switch"] == 0  # nothing is counted before it latches
     # p_up -> 0.02: position worth 20, equity = 10000 - 500 + 20 = 9520, loss 480 >= 400.
     stub.p_up = 0.02
     actions = ex.step(mksnap(ACC_TS + 2))
@@ -707,6 +770,71 @@ def test_requote_throttle_never_delays_cancelling_an_order_above_the_cap() -> No
     assert engine.stats["requotes_throttled"] == 1
 
 
+def test_requote_throttle_counts_a_held_back_placement_with_nothing_to_cancel() -> None:
+    # Every resting order is gone (say, filled or cancelled elsewhere) and the whole ladder is
+    # missing, half a second after the last requote: nothing is sent, and it is counted.
+    engine, _, ex = make_env()
+    ex.step(mksnap(ACC_TS))
+    assert engine.stats["requotes_throttled"] == 0
+    assert engine.on_snapshot(mksnap(ACC_TS + 0.5), []) == []
+    assert engine.stats["requotes_throttled"] == 1
+    assert quote_view(engine.on_snapshot(mksnap(ACC_TS + 1.0), [])) == FULL_LADDER
+
+
+def test_requote_throttle_never_delays_cancelling_the_bids_of_a_token_bought_by_taker() -> None:
+    # 150 unpaired UP appear: the engine completes them with an IOC BUY DOWN, and DOWN is then
+    # not quoted this tick, so its resting bids are cancelled at once even inside the throttle
+    # (leaving them would let a quote fill on top of the taker order and overshoot the pairs).
+    engine, _, ex = make_env()
+    ex.step(mksnap(ACC_TS))
+    resting = ex.open_orders("m1")
+    give(engine, up=150)
+    actions = engine.on_snapshot(mksnap(ACC_TS + 0.5), resting)  # inside the 1 s throttle
+    assert [(r.token, r.side, r.tif, r.size) for r in places(actions) if r.tif is IOC] == [
+        (DOWN, BUY, IOC, 150.0)
+    ]
+    down_ids = {o.order_id for o in resting if o.token is DOWN}
+    assert down_ids <= set(cancels(actions))
+    assert [r for r in places(actions) if r.tif is POST] == []  # the rest waits for the throttle
+
+
+@pytest.mark.parametrize(
+    ("pair", "held", "stopped"),
+    [
+        # net +300 = max_net_imbalance_shares: the heavy UP token is hard-stopped, DOWN (which
+        # completes pairs, but its 0.51 ask is too dear for a taker) keeps its resting ladder.
+        # No inventory skew, so that the orders are NOT also priced above a lowered ceiling:
+        # the lack of room alone has to be what pulls them.
+        (PairConfig(skew_ticks_per_100_shares=0.0), {"up": 300.0, "up_px": 0.49}, {UP}),
+        # 300 of each token = max_inventory_per_side_shares: both tokens are hard-stopped.
+        (
+            PairConfig(max_inventory_per_side_shares=300.0, merge_enabled=False),
+            {"up": 300.0, "down": 300.0},
+            {UP, DOWN},
+        ),
+    ],
+)
+def test_a_hard_stopped_token_is_cancelled_even_inside_the_requote_throttle(
+    pair: PairConfig, held: dict[str, float], stopped: set[Outcome]
+) -> None:
+    # The throttle suppresses discretionary changes only; a token that may no longer carry any
+    # bid at all (no room under a cap) has its resting bids pulled at once, not one interval later.
+    cfg = replace(CFG, timing=TimingConfig(min_requote_interval_seconds=5.0), pair=pair)
+    engine, _, ex = make_env(cfg)
+    ex.step(mksnap(ACC_TS))
+    resting = ex.open_orders("m1")
+    assert len(resting) == 6
+    give(engine, **held)
+    actions = engine.on_snapshot(mksnap(ACC_TS + 1.0), resting)  # inside the 5 s window
+    assert {o.order_id for o in resting if o.token in stopped} == set(cancels(actions))
+    assert places(actions) == []
+    assert engine.stats["requotes_throttled"] == 0  # nothing discretionary was held back
+    # ... and no bid of a stopped token comes back once the throttle has expired.
+    remaining = [o for o in resting if o.token not in stopped]
+    later = engine.on_snapshot(mksnap(ACC_TS + 6.0), remaining)
+    assert [r for r in places(later) if r.token in stopped] == []
+
+
 def test_reconcile_ignores_orders_of_other_markets() -> None:
     engine, _, _ = make_env()
     foreign = OpenOrder("zz", "cz", "m2", UP, BUY, 0.49, 100.0, 100.0, POST, 1.0)
@@ -749,6 +877,39 @@ def test_rate_limiter_places_level_major_and_never_blocks_cancels() -> None:
     assert engine2.stats["orders_rate_limited"] == 2 + 1  # 2 earlier + the DOWN order dropped
 
 
+def test_rate_limiter_places_the_pair_completing_token_first() -> None:
+    # One order a second. UP is heavy (150 @ 0.47), so DOWN bids complete pairs; DOWN's ask 0.53 is
+    # too dear for a taker completion. The single granted order is the completing DOWN bid at its
+    # pair cap (0.51 touch), not UP level 0 (the old (level, UP-first) rank gave UP the quota).
+    cfg = replace(CFG, risk=RiskConfig(max_orders_per_second=1.0))
+    engine, _, ex = make_env(cfg)
+    give(engine, up=150)
+    actions = ex.step(mksnap(ACC_TS, down=(0.51, 0.53)))
+    assert [(r.token.value, r.price) for r in places(actions)] == [("DOWN", 0.51)]
+    assert engine.stats["taker_completions"] == 0
+    assert engine.stats["orders_rate_limited"] == 4  # 5 desired (UP 100 + 50, DOWN x 3), 1 sent
+    # The same economics with the labels swapped (DOWN heavy 150 @ 0.52, UP completes at 0.47).
+    engine2, _, ex2 = make_env(cfg)
+    give(engine2, down=150)
+    actions = ex2.step(mksnap(ACC_TS, up=(0.49, 0.53)))
+    assert [(r.token.value, r.price) for r in places(actions)] == [("UP", 0.47)]
+
+
+def test_rate_limiter_ranks_by_ladder_depth_not_by_what_is_left_to_place() -> None:
+    # One order a second, flat book. Tick 1 places UP level 0. At tick 2 UP level 0 rests, so UP's
+    # remaining levels are 1 and 2 while DOWN has levels 0..2 to place: DOWN level 0 must go before
+    # UP level 1 (every token's level 0 before any level 1). Ranking by the index among the
+    # still-missing orders put UP level 1 first and left DOWN unquoted until UP's ladder was done.
+    cfg = replace(CFG, risk=RiskConfig(max_orders_per_second=1.0))
+    engine, _, ex = make_env(cfg)
+    first = ex.step(mksnap(ACC_TS))
+    assert quote_view(first) == [("UP", 0.49, 100.0)]
+    second = ex.step(mksnap(ACC_TS + 1))
+    assert quote_view(second) == [("DOWN", 0.49, 100.0)]
+    third = ex.step(mksnap(ACC_TS + 2))
+    assert quote_view(third) == [("UP", 0.48, 70.0)]
+
+
 def test_taker_orders_count_against_the_rate_limit_and_come_first() -> None:
     cfg = replace(CFG, risk=RiskConfig(max_orders_per_second=2.0))
     engine, _, ex = make_env(cfg)
@@ -768,10 +929,11 @@ def test_per_market_capital_cap_limits_the_ladder() -> None:
     cfg = replace(CFG, risk=RiskConfig(max_capital_per_market_usd=60.0))
     engine, _, ex = make_env(cfg)
     actions = ex.step(mksnap(ACC_TS))
-    # Budget 60 - 1e-6: UP 100 @ 0.49 = 49.0, then (59.999999 - 49) / 0.48 = 22.91 shares.
-    assert quote_view(actions) == [("UP", 0.49, 100.0), ("UP", 0.48, 22.91)]
+    # Budget 60 - 1e-6 cannot buy both level-0 bids (2 x 49.0): flat, the two tokens share it
+    # evenly, 29.9999995 / 0.49 = 61.22 shares each (not UP-first: UP 100 + 22.91 and no DOWN).
+    assert quote_view(actions) == [("UP", 0.49, 61.22), ("DOWN", 0.49, 61.22)]
     capital = ex.reserved("m1") + engine.portfolio.inventory("m1").capital_at_risk()
-    assert capital == pytest.approx(49.0 + 0.48 * 22.91, abs=1e-9)
+    assert capital == pytest.approx(2 * 0.49 * 61.22, abs=1e-9)
     assert capital <= 60.0
     assert ex.rejected == []
 
@@ -780,11 +942,12 @@ def test_total_capital_cap_is_shared_across_markets() -> None:
     cfg = replace(CFG, risk=RiskConfig(max_total_capital_usd=100.0))
     engine, _, ex = make_env(cfg)
     a = ex.step(mksnap(ACC_TS))
-    # Market m1 consumes the whole 100 USDC budget with UP levels: 49 + 33.6 + 0.47 * 37.02.
-    assert quote_view(a) == [("UP", 0.49, 100.0), ("UP", 0.48, 70.0), ("UP", 0.47, 37.02)]
-    reserved_a = 49.0 + 33.6 + 0.47 * 37.02
+    # Market m1 buys both level-0 bids (2 x 49.0); the 2.0 left cannot rest a minimum order
+    # (5 shares) on a deeper level of either token.
+    assert quote_view(a) == [("UP", 0.49, 100.0), ("DOWN", 0.49, 100.0)]
+    reserved_a = 2 * 49.0
     assert ex.reserved("m1") == pytest.approx(reserved_a)
-    # Market m2 sees the same budget minus m1's believed reservation: 0.0006 USDC -> nothing.
+    # Market m2 sees the same budget minus m1's believed reservation: 2.0 USDC -> nothing.
     b = ex.step(mksnap(ACC_TS, market=MKT2))
     assert places(b) == []
     assert ex.reserved() <= 100.0
@@ -795,17 +958,16 @@ def test_a_market_budget_frees_up_when_the_other_market_cancels() -> None:
     cfg = replace(CFG, risk=RiskConfig(max_total_capital_usd=100.0))
     engine, _, ex = make_env(cfg)
     late = MarketSpec("m3", "ETH", start_ts=1000.0, end_ts=2800.0)  # still ACCUMULATE at 1880
-    ex.step(mksnap(ACC_TS))  # m1 reserves ~100 of the 100 USDC total cap
+    ex.step(mksnap(ACC_TS))  # m1 reserves 98 of the 100 USDC total cap (UP and DOWN level 0)
     assert places(ex.step(mksnap(ACC_TS, market=late))) == []
     # At 1880 m1 is in FLATTEN: its ladder is cancelled and its reservation belief drops to 0.
-    assert len(cancels(ex.step(mksnap(FL_TS)))) == 3
+    assert len(cancels(ex.step(mksnap(FL_TS)))) == 2
     assert ex.reserved("m1") == 0.0
-    # Now m3 may use the whole budget: the same ladder m1 had (49 + 33.6 + 0.47 * 37.02).
+    # Now m3 may use the whole budget: the same ladder m1 had (2 x 49.0).
     freed = ex.step(mksnap(FL_TS, market=late))
     assert [(r.token.value, r.price, r.size) for r in places(freed)] == [
         ("UP", 0.49, 100.0),
-        ("UP", 0.48, 70.0),
-        ("UP", 0.47, 37.02),
+        ("DOWN", 0.49, 100.0),
     ]
     assert ex.rejected == []
 
@@ -873,8 +1035,9 @@ def test_other_markets_see_the_taker_fee_of_an_in_flight_completion() -> None:
     # Total capital cap 260. m1 holds UP 150 @ 0.47 (cost 70.5) and sends an IOC DOWN 150 @ 0.51
     # that stays in flight: it ties up 76.5 + worst-case fee 150 * 0.007962376 = 77.69436. m1's
     # ladder (UP 0.47 x 100 + 0.46 x 50 = 70) completes the belief: 147.69436.
-    # m2's budget = 260 - 70.5 - 147.69436 - 1e-6 = 41.80564 -> UP 0.49 x floor(41.80564/0.49)
-    # = 85.31. (Without the fee the belief would be 146.5 and m2 would size 87.75.)
+    # m2's budget = 260 - 70.5 - 147.69436 - 1e-6 = 41.80564, shared evenly by its flat UP and
+    # DOWN level 0: 0.49 x floor(20.90282 / 0.49) = 42.65 each. (Without the fee the belief
+    # would be 146.5, the budget 43.0 and each side 43.87.)
     cfg = replace(CFG, risk=RiskConfig(max_total_capital_usd=260.0))
     engine, _, _ = make_env(cfg)
     ex = FakeExchange(engine, delay_ioc=True)
@@ -883,19 +1046,22 @@ def test_other_markets_see_the_taker_fee_of_an_in_flight_completion() -> None:
     assert [(r.token, r.tif, r.size) for r in places(first)][0] == (DOWN, IOC, 150.0)
     assert quote_view(first) == [("UP", 0.47, 100.0), ("UP", 0.46, 50.0)]
     second = ex.step(mksnap(ACC_TS, market=MKT2))
-    assert quote_view(second)[0] == ("UP", 0.49, 85.31)
+    assert quote_view(second) == [("UP", 0.49, 42.65), ("DOWN", 0.49, 42.65)]
     assert ex.rejected == []
 
 
 def test_in_flight_ioc_reservation_is_not_reused_by_the_new_ladder() -> None:
     # Cash 200, UP 150 @ 0.47 (cash 129.5). A DOWN IOC for 150 @ 0.51 from an earlier snapshot
     # is still in flight and holds 76.5 + fee 1.19436 = 77.69436 (it is never re-planned). The new
-    # ladder may use 129.5 - 77.69436 - 1e-6 = 51.80564: UP 0.47 x 100 = 47, then 10.44 @ 0.46.
+    # ladder may use 129.5 - 77.69436 - 1e-6 = 51.80564. DOWN completes the 150 unpaired UP, so it
+    # is funded first: 0.49 x 100 = 49, then 2.80564 / 0.48 = 5.84 shares at 0.48; the heavy UP
+    # token gets nothing of the scarce cash.
     engine, _, _ = make_env(initial_cash=200.0)
     give(engine, up=150)
     pending = OpenOrder("ox", "cx", "m1", DOWN, BUY, 0.51, 150.0, 150.0, IOC, 1.0, live=False)
     actions = engine.on_snapshot(mksnap(ACC_TS), [pending])
-    assert quote_view(actions) == [("UP", 0.47, 100.0), ("UP", 0.46, 10.44)]
+    assert quote_view(actions) == [("DOWN", 0.49, 100.0), ("DOWN", 0.48, 5.84)]
+    assert 0.49 * 100.0 + 0.48 * 5.84 <= 129.5 - 77.69436  # the in-flight IOC's cash is not reused
     assert [r for r in places(actions) if r.tif is IOC] == []  # and no second completion
 
 
@@ -923,6 +1089,50 @@ def test_no_completion_while_one_is_in_flight_or_unprofitable() -> None:
     actions = engine2.on_snapshot(mksnap(ACC_TS, down=(0.51, 0.53)), [])
     assert [r for r in places(actions) if r.tif is IOC] == []
     assert engine2.stats["taker_completions"] == 0
+
+
+@pytest.mark.parametrize(
+    ("order", "blocks"),
+    [
+        # Only an IOC BUY of this market that is still in flight stops a new completion ...
+        (OpenOrder("ox", "cx", "m1", DOWN, BUY, 0.51, 150.0, 150.0, IOC, 1.0, live=False), True),
+        # ... not our own resting passive bids (either token) ...
+        (OpenOrder("ox", "cx", "m1", UP, BUY, 0.47, 100.0, 100.0, POST, 1.0), False),
+        (OpenOrder("ox", "cx", "m1", DOWN, BUY, 0.49, 100.0, 100.0, POST, 1.0), False),
+        # ... and not an IOC sell.
+        (OpenOrder("ox", "cx", "m1", UP, SELL, 0.49, 50.0, 50.0, IOC, 1.0, live=False), False),
+    ],
+)
+def test_completion_is_blocked_only_by_an_ioc_buy_in_flight(order: OpenOrder, blocks: bool) -> None:
+    engine, _, _ = make_env()
+    give(engine, up=150)  # unpaired UP 150 @ 0.47: the IOC BUY DOWN 150 @ 0.51 is profitable
+    actions = engine.on_snapshot(mksnap(ACC_TS), [order])
+    iocs = [(r.token, r.side, r.price, r.size) for r in places(actions) if r.tif is IOC]
+    assert iocs == ([] if blocks else [(DOWN, BUY, 0.51, 150.0)])
+    assert engine.stats["taker_completions"] == (0 if blocks else 1)
+
+
+def test_a_completion_the_rate_limiter_refuses_is_counted_dropped_and_retried() -> None:
+    # One order a second. m1 and m2 each hold 150 unpaired UP and want an IOC BUY DOWN 150. The
+    # first completion takes the second's only slot; the other is refused: counted, not sent, and
+    # its token is then quoted passively like any other (nothing is left for those either).
+    cfg = replace(CFG, risk=RiskConfig(max_orders_per_second=1.0))
+    engine, _, _ = make_env(cfg)
+    give(engine, up=150, market="m1")
+    give(engine, up=150, market="m2")
+    first = places(engine.on_snapshot(mksnap(ACC_TS), []))
+    assert [(r.market_id, r.tif, r.size) for r in first] == [("m1", IOC, 150.0)]
+    second = places(engine.on_snapshot(mksnap(ACC_TS, market=MKT2), []))
+    assert second == []
+    assert engine.stats["taker_completions"] == 1
+    limited = engine.stats["orders_rate_limited"]
+    assert limited >= 2  # the refused completion and the quotes that found no slot either
+    # A second later the slot is free again: the completion goes out (it is planned afresh).
+    retry = places(engine.on_snapshot(mksnap(ACC_TS + 1.0, market=MKT2), []))
+    assert [(r.market_id, r.token, r.side, r.tif, r.size) for r in retry] == [
+        ("m2", DOWN, BUY, IOC, 150.0)
+    ]
+    assert engine.stats["taker_completions"] == 2
 
 
 def test_completion_respects_the_directional_allowance() -> None:
@@ -977,6 +1187,53 @@ def test_dearer_token_mid_prices_the_compounding_clip() -> None:
     s = mksnap(ACC_TS, up=(0.79, 0.81), down=(0.19, 0.21))
     sizes = {t: sz for t, _, sz in quote_view(ex.step(s))}
     assert sizes["UP"] == 125.0
+
+
+def realise(engine: MarketMakerEngine, pnl: float) -> None:
+    """Realise ``pnl`` USDC in another market (buy 5000 pairs, merge them): equity 10000 + pnl."""
+    n = 5000.0
+    give(engine, up=n, down=n, market="mX", up_px=0.40, down_px=0.60 - pnl / n)
+    engine.on_merge(MergeResult("mX", n, n, 2.0))
+    assert engine.equity() == pytest.approx(10_000.0 + pnl)
+
+
+@pytest.mark.parametrize(("pnl", "level0"), [(0.0, 100.0), (1000.0, 110.0), (-250.0, 97.5)])
+def test_clip_equity_fraction_follows_current_equity_not_initial_cash(
+    pnl: float, level0: float
+) -> None:
+    # clip = equity * 0.005 / 0.50 (the dearer mid): the compounding loop of DESIGN 2.3 resizes
+    # with what the account is worth NOW, up after a profit and down after a loss. (The test above
+    # varies initial_cash, which is also the current equity there, so it cannot tell the two apart.)
+    cfg = replace(NO_DIRECTIONAL, sizing=SizingConfig(clip_equity_fraction=0.005))
+    engine, _, ex = make_env(cfg)
+    if pnl:
+        realise(engine, pnl)
+    assert quote_view(ex.step(mksnap(ACC_TS)))[0] == ("UP", 0.49, level0)
+
+
+def test_directional_target_is_sized_with_current_equity_not_initial_cash() -> None:
+    # Kelly sizing (DESIGN 2.4) scales with equity. In WIND_DOWN, flat, the favoured token's room
+    # is exactly the target, so the UP quotes show the target the engine computed. A small
+    # kelly_fraction keeps it below max_directional_shares, where the equity cannot show.
+    cfg = replace(CFG, directional=DirectionalConfig(kelly_fraction=0.02))
+    sized: dict[float, float] = {}
+    for pnl in (-250.0, 0.0, 1000.0):
+        engine, _, _ = make_env(cfg, p_up=0.6)
+        if pnl:
+            realise(engine, pnl)
+        snap = mksnap(WD_TS)
+        actions = engine.on_snapshot(snap, [])
+        fair = engine.last_fair("m1")
+        assert fair is not None
+        target = directional_target(
+            snap=snap, fair=fair, inv=engine.portfolio.inventory("m1"), cfg=cfg,
+            fees=engine.fees, equity=10_000.0 + pnl,
+        )  # fmt: skip
+        assert 0.0 < target < cfg.directional.max_directional_shares
+        up_size = sum(r.size for r in places(actions) if r.token is UP)
+        assert up_size == pytest.approx(floor_size(target), abs=1e-9)
+        sized[pnl] = up_size
+    assert sized[-250.0] < sized[0.0] < sized[1000.0]
 
 
 # ------------------------------------------------------------------- state, snapshots, settlement
@@ -1069,6 +1326,19 @@ def test_accessors_marks_and_equity() -> None:
     assert engine.equity() == pytest.approx(9953.0 + 60.0)
 
 
+def test_marks_use_the_shrunk_p_up_not_the_raw_model_probability() -> None:
+    # DESIGN 3 / 4.2: positions are marked at the shrunk p_up (the one the strategy trades on),
+    # which also feeds the kill switch and the Kelly equity; the raw model output p_up_model is
+    # for calibration reports only. The StubModel returns them different (RAW_MODEL_OFFSET).
+    engine, _, ex = make_env(p_up=0.6)
+    ex.step(mksnap(ACC_TS))
+    fair = engine.last_fair("m1")
+    assert fair is not None and fair.p_up == 0.6 and fair.p_up_model == pytest.approx(0.64)
+    assert engine.marks() == {"m1": 0.6}
+    give(engine, up=100)
+    assert engine.equity() == pytest.approx(9953.0 + 100 * 0.6)
+
+
 def test_invalid_model_marks_at_the_market_mid() -> None:
     engine, _, ex = make_env(valid=False, p_up=0.5)
     ex.step(mksnap(ACC_TS, up=(0.59, 0.61), down=(0.39, 0.41)))
@@ -1119,7 +1389,7 @@ def test_real_model_warms_up_then_quotes_and_is_deterministic() -> None:
 
 
 def _run_random_episode(
-    seed: int,
+    seed: int, *, cash: float = 3000.0, maker_fee: float = 0.0
 ) -> tuple[MarketMakerEngine, FakeExchange, list[list[Action]], int]:
     """Two markets (BTC, ETH) over a 300 s window with random walks, fills and glitches."""
     rng = random.Random(seed)
@@ -1128,8 +1398,9 @@ def _run_random_episode(
         model=ModelConfig(),
         risk=RiskConfig(max_capital_per_market_usd=900.0, max_total_capital_usd=1400.0),
         exchange=CFG.exchange,
+        fees=replace(CFG.fees, maker_fee_rate=maker_fee),
     )
-    engine = MarketMakerEngine(cfg, initial_cash=3000.0)
+    engine = MarketMakerEngine(cfg, initial_cash=cash)
     ex = FakeExchange(engine)
     end = 1300.0
     markets = [MarketSpec("m1", "BTC", 1000.0, end), MarketSpec("m2", "ETH", 1000.0, end)]
@@ -1201,7 +1472,7 @@ def _run_random_episode(
                     if qty >= 0.01:
                         ex.maker_fill(o.order_id, size=min(qty, o.remaining), ts=ts)
             log.append(actions)
-            assert engine.portfolio.cash - ex.reserved() >= -1e-6
+            assert engine.portfolio.cash - ex.committed() >= -1e-6
             for mk in markets:
                 cap_m = engine.portfolio.inventory(mk.market_id).capital_at_risk() + ex.reserved(
                     mk.market_id
@@ -1219,7 +1490,7 @@ def _run_random_episode(
         totals += engine.on_settlement(
             Settlement(m.market_id, winner, end, payout=inv.qty[winner])
         ).total
-    assert engine.portfolio.cash == pytest.approx(3000.0 + totals, abs=1e-6)
+    assert engine.portfolio.cash == pytest.approx(cash + totals, abs=1e-6)
     assert engine.equity() == pytest.approx(engine.portfolio.cash, abs=1e-9)
     return engine, ex, log, pair_cap_checks
 
@@ -1232,6 +1503,19 @@ def test_random_episodes_never_overdraw_never_cross_and_balance(seed: int) -> No
     assert len(ids) == len(set(ids))  # client ids are unique
     assert engine.stats["quotes_placed"] > 20  # the episode actually traded
     assert engine.stats["snapshots"] >= 500
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+@pytest.mark.parametrize("cash", [250.0, 600.0])
+def test_random_episodes_with_a_maker_fee_and_binding_cash_are_never_refused(
+    seed: int, cash: float
+) -> None:
+    """Two markets sharing a small account, random maker fills (partial and full) and a 2% maker
+    fee: the engine's belief of the other market's reservation includes the fee the exchange
+    commits for a resting bid and drops it again when the bid fills, so no order is refused."""
+    engine, ex, _, _ = _run_random_episode(seed, cash=cash, maker_fee=0.02)
+    assert ex.rejected == [], ex.rejected[:5]
+    assert engine.stats["quotes_placed"] > 20 and engine.stats["fills"] > 0
 
 
 def test_random_episodes_exercise_every_engine_path() -> None:

@@ -14,15 +14,20 @@ Commands
 ``record --out FILE``  write the synthetic feed to JSONL (plus a ``FILE.meta.json`` sidecar that
               marks the file as synthetic, so ``replay`` labels it correctly).
 ``paper``     LIVE READ-ONLY public data + paper exchange. Needs network access and the flag
-              ``--i-understand-this-is-paper-only``. Endpoints are UNVERIFIED (see
-              ``abc_trading.data.public_api``). It can never place a real order.
+              ``--i-understand-this-is-paper-only`` (spelled out in full: options cannot be
+              abbreviated, so a shortened ``--i`` does not count). Endpoints are UNVERIFIED (see
+              ``abc_trading.data.public_api``) and the market winners are INFERRED from spot
+              prices (``abc_trading.data.live``). It can never place a real order.
 ``config``    print the effective configuration as JSON.
 
 Configuration: ``--config PATH`` (TOML, default: built-in defaults), then the dedicated flags
 (``--seed``, ``--windows``, ``--assets``), then every ``--set section.key=value`` in order.
 Values are coerced through the config dataclass field types: ``bool`` (true/false/yes/no/on/off/
 1/0), ``int``, ``float``, ``float | None`` (``none``), tuples (``a,b``) and dicts (``A=1,B=2``,
-merged into the existing mapping). An unknown section or key is an error.
+merged into the existing mapping). An unknown section or key is an error. Values in a TOML file are
+not coerced: each must have the declared type (a quoted ``"false"`` or ``3.0`` for an integer key
+is an error naming the key). ``BotConfig.advisories()`` notes (a kill switch that can never fire)
+are printed as ``warning:`` lines on stderr.
 
 Exit codes: 0 ok, 2 usage / configuration / input-data error, 3 invariant violation, 4 (paper
 only) public data unreachable, 130 interrupted.
@@ -62,6 +67,12 @@ EXIT_UNREACHABLE = 4
 EXIT_INTERRUPTED = 130
 
 PAPER_FLAG = "--i-understand-this-is-paper-only"
+PAPER_NOTE = (
+    "Reads PUBLIC market data over HTTP and feeds it to the simulated exchange; it can never "
+    "place a real order. The data client is UNVERIFIED against the live endpoints (a paper run "
+    "has never been checked against them) and market winners are inferred from Binance/Coinbase "
+    "spot prices, not read from Polymarket's resolution."
+)
 META_SUFFIX = ".meta.json"
 
 
@@ -167,7 +178,11 @@ def build_config(args: argparse.Namespace) -> BotConfig:
     if getattr(args, "sim_assets", None) is not None:
         overrides.append("sim.assets=" + ",".join(args.sim_assets))
     overrides.extend(args.set)
-    return apply_overrides(cfg, overrides) if overrides else cfg
+    if overrides:
+        cfg = apply_overrides(cfg, overrides)
+    for note in cfg.advisories():  # legal but probably unintended (not an error): say so
+        print(f"warning: {note}", file=sys.stderr)
+    return cfg
 
 
 # --------------------------------------------------------------------------- parser
@@ -238,19 +253,24 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # No option may be abbreviated (allow_abbrev=False, on every subparser too): argparse would
+    # otherwise accept "paper --i" for the deliberate --i-understand-this-is-paper-only flag.
     parser = argparse.ArgumentParser(
         prog="abc-trading",
         description="Backtest / paper-trading framework for a Polymarket Up/Down market maker. "
         "No live trading exists; synthetic results validate mechanics, not profitability.",
+        allow_abbrev=False,
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    p = sub.add_parser("backtest", help="run the strategy on a synthetic feed")
+    p = sub.add_parser("backtest", help="run the strategy on a synthetic feed", allow_abbrev=False)
     _add_config_args(p, sim=True)
     _add_run_args(p)
     p.set_defaults(handler=_cmd_backtest)
 
-    p = sub.add_parser("replay", help="run the strategy on a recorded JSONL event file")
+    p = sub.add_parser(
+        "replay", help="run the strategy on a recorded JSONL event file", allow_abbrev=False
+    )
     p.add_argument("file", metavar="FILE.jsonl")
     _add_config_args(p, sim=False)
     _add_run_args(p)
@@ -261,13 +281,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(handler=_cmd_replay)
 
-    p = sub.add_parser("record", help="write the synthetic feed to a JSONL file")
+    p = sub.add_parser(
+        "record", help="write the synthetic feed to a JSONL file", allow_abbrev=False
+    )
     _add_config_args(p, sim=True)
     p.add_argument("--out", metavar="FILE", required=True, help="output JSONL path")
     p.set_defaults(handler=_cmd_record)
 
     p = sub.add_parser(
-        "paper", help="LIVE READ-ONLY public data + paper exchange (never places real orders)"
+        "paper",
+        help="LIVE READ-ONLY public data + paper exchange (never places real orders); "
+        "data client UNVERIFIED, winners inferred",
+        description=PAPER_NOTE,
+        allow_abbrev=False,
     )
     _add_config_args(p, sim=False)
     _add_run_args(p)
@@ -294,7 +320,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--record", metavar="FILE", help="also record the events to this JSONL file")
     p.set_defaults(handler=_cmd_paper)
 
-    p = sub.add_parser("config", help="print the effective configuration as JSON")
+    p = sub.add_parser(
+        "config", help="print the effective configuration as JSON", allow_abbrev=False
+    )
     _add_config_args(p, sim=True)
     p.set_defaults(handler=_cmd_config)
     return parser
@@ -453,7 +481,9 @@ def _cmd_paper(args: argparse.Namespace) -> int:
     events: Iterable[FeedEvent] = record(feed, args.record) if args.record else feed
     print(
         f"paper mode: following {','.join(assets)} ({window}s windows), polling every "
-        f"{args.poll_seconds:g}s. Public data only, simulated fills. Ctrl-C to stop.",
+        f"{args.poll_seconds:g}s. Public data only, simulated fills. Data client UNVERIFIED "
+        "against the live endpoints; winners are inferred from spot prices (not Polymarket's "
+        "resolution). Ctrl-C to stop.",
         file=sys.stderr,
     )
     result = run_backtest(

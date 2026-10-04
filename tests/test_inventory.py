@@ -951,6 +951,143 @@ def test_equity_of_empty_portfolio_is_cash() -> None:
     assert Portfolio(123.0).equity({"x": 0.5}) == 123.0
 
 
+# --------------------------------------------------------------------------- scan cost
+
+
+class _ProbeInventory(MarketInventory):
+    """A ``MarketInventory`` that records every touch of a ``Portfolio`` total: a call to
+    ``capital_at_risk``/``value_at`` or a read of ``settled`` (the flag the old scan tested)."""
+
+    touched: set[str] = set()
+
+    @property
+    def settled(self) -> bool:
+        _ProbeInventory.touched.add(self.market_id)
+        return self._settled
+
+    @settled.setter
+    def settled(self, value: bool) -> None:
+        self._settled = value
+
+    def capital_at_risk(self) -> float:
+        _ProbeInventory.touched.add(self.market_id)
+        return super().capital_at_risk()
+
+    def value_at(self, p_up: float) -> float:
+        _ProbeInventory.touched.add(self.market_id)
+        return super().value_at(p_up)
+
+
+def _scan_everything(pf: Portfolio, marks: dict[str, float]) -> tuple[float, float]:
+    """The totals as the original full scan over ``pf.inventories`` computes them."""
+    car = sum((inv.capital_at_risk() for inv in pf.inventories.values()), 0.0)
+    total = pf.cash
+    for market_id, inv in pf.inventories.items():
+        if inv.settled:
+            continue
+        mark = marks.get(market_id)
+        total += inv.capital_at_risk() if mark is None else inv.value_at(mark)
+    return car, total
+
+
+def test_portfolio_totals_do_not_visit_settled_inventories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``capital_at_risk``/``equity`` run on every snapshot of a backtest, so their cost must follow
+    the markets that are open, not every market the run has seen (the run would be quadratic)."""
+    monkeypatch.setattr("abc_trading.inventory.MarketInventory", _ProbeInventory)
+
+    def touched_by_totals(n_settled: int) -> set[str]:
+        pf = Portfolio(1e9)
+        for i in range(n_settled):
+            mid = f"done-{i}"
+            pf.apply_fill(buy(UP, 0.5, 10.0, market=mid))
+            pf.apply_settlement(Settlement(mid, UP, 1.0, 10.0))
+        pf.apply_fill(buy(UP, 0.4, 10.0, market="open-a"))
+        pf.apply_fill(buy(DOWN, 0.3, 20.0, market="open-b"))
+        pf.inventory("open-flat")  # created, never traded: still open
+        marks = {"open-a": 0.6, "done-0": 0.9}
+        _ProbeInventory.touched = set()
+        car = pf.capital_at_risk()
+        eq = pf.equity(marks)
+        pnl = pf.realised_pnl()
+        # open-a marked 0.6 -> 10 * 0.6 = 6 ; open-b has no mark -> at cost 6 ; the settled
+        # markets (and the mark given for one of them) are already in cash
+        assert car == approx(4.0 + 6.0)
+        assert eq == approx(pf.cash + 6.0 + 6.0)
+        assert pnl == approx(pf.cash + car - pf.initial_cash)
+        return set(_ProbeInventory.touched)
+
+    few, many = touched_by_totals(3), touched_by_totals(400)
+    assert many == few  # 400 settled markets cost nothing more than 3
+    assert few <= {"open-a", "open-b", "open-flat"}
+
+
+def test_portfolio_totals_forget_inventories_settled_outside_the_portfolio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller can settle an inventory it holds (``inv.apply_settlement``) or flag it. The totals
+    must follow the flag, and a settled inventory is dropped from the scan once seen."""
+    monkeypatch.setattr("abc_trading.inventory.MarketInventory", _ProbeInventory)
+    pf = Portfolio(1000.0)
+    for mid in ("a", "c", "d"):
+        pf.apply_fill(buy(UP, 0.5, 10.0, market=mid))  # cost 5 each
+    pf.inventory("b")  # a flat inventory ...
+    pf.inventories["a"].apply_settlement(UP)  # ... one settled behind the portfolio's back
+    pf.inventories["b"].settled = True  # ... and one that is only flagged
+    cash = pf.cash  # 985: the portfolio did not see a's payout, only the totals are under test
+    assert pf.capital_at_risk() == approx(10.0)  # c and d
+    assert pf.equity({"a": 0.1, "c": 0.8}) == approx(cash + 8.0 + 5.0)  # c marked, d at cost
+    _ProbeInventory.touched = set()
+    assert pf.capital_at_risk() == approx(10.0)
+    assert pf.equity({}) == approx(cash + 10.0)
+    assert _ProbeInventory.touched <= {"c", "d"}  # a and b were dropped when first seen
+
+
+def test_portfolio_totals_see_inventories_added_to_the_dict_directly() -> None:
+    pf = Portfolio(1000.0)
+    pf.apply_fill(buy(UP, 0.5, 10.0, market="a"))
+    assert pf.capital_at_risk() == approx(5.0)
+    inv = MarketInventory("b")
+    inv.apply_fill(buy(DOWN, 0.4, 10.0, market="b"))
+    pf.inventories["b"] = inv  # not through the Portfolio methods
+    assert pf.capital_at_risk() == approx(9.0)
+    assert pf.equity({"b": 0.5}) == pf.cash + 5.0 + 5.0
+    pf.apply_fill(buy(UP, 0.2, 10.0, market="c"))
+    assert pf.capital_at_risk() == approx(11.0)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_portfolio_totals_equal_the_full_scan_under_random_trading(seed: int) -> None:
+    """Bit-identical to scanning every inventory, with markets opening and settling all along
+    (the backtest numbers must not move by an ulp because of the open-markets index)."""
+    rng = random.Random(seed)
+    pf = Portfolio(5000.0)
+    live: list[str] = []
+    next_id = 0
+    for step in range(600):
+        if not live or (len(live) < 4 and rng.random() < 0.5):
+            live.append(f"m{next_id}")
+            next_id += 1
+        mid = rng.choice(live)
+        r = rng.random()
+        inv = pf.inventory(mid)
+        if r < 0.55:
+            token = rng.choice((UP, DOWN))
+            pf.apply_fill(buy(token, rng.randint(5, 95) / 100, rng.randint(1, 30) / 3, market=mid))
+        elif r < 0.7 and inv.paired_qty > EPS:
+            pf.apply_merge(MergeResult(mid, inv.paired_qty / 2, inv.paired_qty / 2, 0.0))
+        elif r < 0.85:
+            winner = rng.choice((UP, DOWN))
+            pf.apply_settlement(Settlement(mid, winner, 1.0, inv.qty[winner]))
+            live.remove(mid)
+        marks = {m: rng.random() for m in pf.inventories if rng.random() < 0.7}  # settled too
+        car, eq = _scan_everything(pf, marks)
+        assert pf.capital_at_risk() == car
+        assert pf.equity(marks) == eq, step
+    assert any(inv.settled for inv in pf.inventories.values())
+
+
 # --------------------------------------------------------------------------- reserved cash
 
 

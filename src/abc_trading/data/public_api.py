@@ -21,7 +21,12 @@ Design
   are easy to find and fix.
 * Parsing is defensive: any unexpected shape raises ``DataError`` with a short message;
   nothing is silently defaulted. Prices/sizes are floats (USDC per share / shares, as in
-  ``types.py``); timestamps are unix seconds.
+  ``types.py``); timestamps are unix seconds. A response that cannot be decoded at all (not
+  JSON, not UTF-8, or nested so deeply that the decoder gives up) is a ``DataError`` too, and
+  so is a redirect to anything but http(s). The one exception to "raise" is the trades list,
+  where a record that does not parse is skipped and counted (``PolymarketPublicClient.stats``).
+  Callers (``LiveFeed``) rely on this: nothing but ``DataError`` is meant to escape from
+  well-formed calls, so any other exception is a bug and propagates.
 * Clients hold only small caches / counters; they never touch a clock or the disk.
 """
 
@@ -37,7 +42,7 @@ import urllib.request
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import Any, NotRequired, Protocol, TypedDict
+from typing import IO, Any, NotRequired, Protocol, TypedDict
 
 from abc_trading.types import BookSnapshot, Level, Outcome, Side, Trade
 
@@ -129,12 +134,62 @@ def _with_params(url: str, params: Mapping[str, str] | None) -> str:
     return url + sep + urllib.parse.urlencode(dict(params))
 
 
+_HTTP_SCHEMES = ("http", "https")
+
+
+class _HttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follows redirects, but only to http(s) URLs (the stock handler also follows ``ftp:``)."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        scheme = urllib.parse.urlsplit(newurl).scheme
+        if scheme not in _HTTP_SCHEMES:
+            fp.close()
+            # Only the scheme is named: the target URL may carry a query string.
+            raise urllib.error.URLError(f"refusing redirect to a non-http(s) URL ({scheme}:)")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _http_only_opener() -> urllib.request.OpenerDirector:
+    """An opener that can fetch http(s) and nothing else.
+
+    ``urllib.request.build_opener()`` also installs FTP, ``file:`` and ``data:`` handlers, which
+    a redirect (or a proxy variable such as ``ftp_proxy``) could reach. Here only the http(s)
+    proxy variables are honoured (``NO_PROXY`` still applies), every other scheme is an
+    ``unknown url type`` error, and redirects go through ``_HttpOnlyRedirectHandler``.
+    """
+    proxies = {k: v for k, v in urllib.request.getproxies().items() if k in _HTTP_SCHEMES}
+    handlers: list[urllib.request.BaseHandler] = [
+        urllib.request.ProxyHandler(proxies),
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        _HttpOnlyRedirectHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ]
+    if hasattr(http.client, "HTTPSConnection"):  # missing only when ssl is unavailable
+        handlers.append(urllib.request.HTTPSHandler())
+    opener = urllib.request.OpenerDirector()
+    for handler in handlers:
+        opener.add_handler(handler)
+    return opener
+
+
 class UrllibTransport:
     """``Transport`` over ``urllib``. Only http(s) URLs are fetched (never ``file:`` etc.).
 
-    ``opener`` is injectable for tests; the default ``build_opener()`` reads the proxy
-    environment variables when the transport is constructed. Redirects are followed, the body
-    is capped at ``max_bytes``, and every failure becomes a short ``DataError``.
+    The request URL and every redirect target must be http(s), and the default opener has no
+    FTP / ``file:`` / ``data:`` handler at all (see ``_http_only_opener``). ``opener`` is
+    injectable for tests; the default one reads the http(s) proxy environment variables when
+    the transport is constructed. Redirects between http(s) URLs are followed, the body is
+    capped at ``max_bytes``, and every failure becomes a short ``DataError``.
     """
 
     def __init__(
@@ -147,7 +202,7 @@ class UrllibTransport:
         if max_bytes <= 0:
             raise ValueError(f"max_bytes must be > 0, got {max_bytes!r}")
         self._user_agent = user_agent
-        self._opener: _Opener = opener if opener is not None else urllib.request.build_opener()
+        self._opener: _Opener = opener if opener is not None else _http_only_opener()
         self._max_bytes = max_bytes
 
     def get_json(
@@ -170,6 +225,8 @@ class UrllibTransport:
         body = self._fetch(request, where, timeout)
         try:
             return json.loads(body.decode("utf-8"))
+        except RecursionError:  # not a ValueError: the decoder recurses once per nesting level
+            raise DataError(f"invalid JSON from {where}: nested too deeply") from None
         except ValueError:  # JSONDecodeError and UnicodeDecodeError
             raise DataError(f"invalid JSON from {where}") from None
 
@@ -226,6 +283,8 @@ def _as_list(value: Any, what: str) -> list[Any]:
     if isinstance(value, str):
         try:
             value = json.loads(value)
+        except RecursionError:  # see UrllibTransport.get_json
+            raise DataError(f"{what}: string is nested too deeply") from None
         except ValueError:
             raise DataError(f"{what}: string is not valid JSON") from None
     if not isinstance(value, list):
@@ -552,6 +611,9 @@ class PolymarketPublicClient:
             raise DataError("trade size must be > 0")
         ts = _to_seconds(_first(record, _TRADE_TS_KEYS), "trade timestamp")
         tx = _first(record, _TRADE_TX_KEYS)
+        if tx is not None and (isinstance(tx, bool) or not isinstance(tx, str | int)):
+            # also keeps ``key`` hashable: a list/dict hash would raise TypeError in _remember
+            raise DataError(f"trade transaction hash: expected a string, got {type(tx).__name__}")
         key = (condition_id, tx, token, side, price, size, ts)
         return key, Trade(ts=ts, token=token, price=price, size=size, aggressor=side)
 

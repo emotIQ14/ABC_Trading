@@ -219,6 +219,14 @@ class Portfolio:
     Cash moves with every fill (price * size, plus/minus the fee), merge and settlement, so
     ``realised_pnl() = cash + capital_at_risk - initial_cash`` always reconciles with the
     per-market realised pnl.
+
+    ``inventories`` keeps every market the portfolio has seen, settled ones included (their
+    realised pnl is still reported), but the totals that are read on every snapshot
+    (``capital_at_risk``, ``realised_pnl``, ``equity``) only walk the markets that are still
+    open. Their cost follows the number of open markets, not the number of markets so far, so a
+    run of N markets costs O(N) and not O(N^2). Add inventories through ``inventory`` / the
+    ``apply_*`` methods; the open-market index also notices an inventory that was settled, or put
+    into ``inventories``, by hand, and then rescans once.
     """
 
     def __init__(self, initial_cash: float) -> None:
@@ -227,12 +235,18 @@ class Portfolio:
         self.initial_cash = initial_cash
         self.cash = initial_cash
         self.inventories: dict[str, MarketInventory] = {}
+        # The unsettled members of ``inventories`` in creation order (the order a full scan would
+        # sum them in, so the totals are bit-identical to one), and how many entries of
+        # ``inventories`` the index has accounted for.
+        self._open: dict[str, MarketInventory] = {}
+        self._indexed = 0
 
     def inventory(self, market_id: str) -> MarketInventory:
         """Get-or-create the inventory for ``market_id``."""
         inv = self.inventories.get(market_id)
         if inv is None:
-            inv = self.inventories[market_id] = MarketInventory(market_id)
+            inv = MarketInventory(market_id)
+            self._register(inv)
         return inv
 
     def apply_fill(self, fill: Fill) -> None:
@@ -249,7 +263,7 @@ class Portfolio:
         else:
             delta = fill.price * fill.size - fill.fee
         inv.apply_fill(fill)
-        self.inventories.setdefault(fill.market_id, inv)
+        self._register(inv)
         self.cash += delta
 
     def apply_merge(self, result: MergeResult) -> float:
@@ -275,7 +289,8 @@ class Portfolio:
                 f"in {s.market_id!r}"
             )
         breakdown = inv.apply_settlement(s.winner)
-        self.inventories.setdefault(s.market_id, inv)
+        self._register(inv)
+        self._open.pop(s.market_id, None)  # settled: out of the per-snapshot totals for good
         self.cash += s.payout
         return breakdown
 
@@ -285,9 +300,37 @@ class Portfolio:
         inv = self.inventories.get(market_id)
         return MarketInventory(market_id) if inv is None else inv
 
+    def _register(self, inv: MarketInventory) -> None:
+        """Add ``inv`` to ``inventories`` (and to the open-market index unless it is settled);
+        a no-op if its market is already there."""
+        if inv.market_id in self.inventories:
+            return
+        self.inventories[inv.market_id] = inv
+        self._indexed += 1
+        if not inv.settled:
+            self._open[inv.market_id] = inv
+
+    def _unsettled(self) -> dict[str, MarketInventory]:
+        """The inventories that are not settled, in creation order (cost: the open markets only).
+
+        ``apply_settlement`` drops a market from the index itself. The two checks below only
+        matter for inventories changed without going through this class: an entry added to
+        ``inventories`` directly is picked up (one rescan, noticed by the count), and an inventory
+        settled on its own (``inv.apply_settlement``) is dropped the first time it is seen.
+        """
+        if len(self.inventories) != self._indexed:
+            self._open = {m: inv for m, inv in self.inventories.items() if not inv.settled}
+            self._indexed = len(self.inventories)
+        for inv in self._open.values():
+            if inv.settled:  # rebuilding also drops the dead slots a mass of removals leaves
+                self._open = {m: i for m, i in self._open.items() if not i.settled}
+                break
+        return self._open
+
     def capital_at_risk(self) -> float:
-        """Total all-in cost basis of open positions across markets (USDC)."""
-        return sum((inv.capital_at_risk() for inv in self.inventories.values()), 0.0)
+        """Total all-in cost basis of open positions across markets (USDC). A settled market holds
+        nothing, so only the open markets are visited."""
+        return sum((inv.capital_at_risk() for inv in self._unsettled().values()), 0.0)
 
     def realised_pnl(self) -> float:
         return self.cash + self.capital_at_risk() - self.initial_cash
@@ -296,9 +339,7 @@ class Portfolio:
         """Cash plus open positions marked at ``marks[market_id]`` (a p_up); a market without a
         mark is valued at cost. Settled markets are already in cash."""
         total = self.cash
-        for market_id, inv in self.inventories.items():
-            if inv.settled:
-                continue
+        for market_id, inv in self._unsettled().items():
             mark = marks.get(market_id)
             total += inv.capital_at_risk() if mark is None else inv.value_at(mark)
         return total

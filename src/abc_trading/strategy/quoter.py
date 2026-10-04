@@ -30,9 +30,18 @@ For each token ``T`` (opposite ``O``) in the order UP, DOWN:
    below one tick end the ladder; a level whose price repeats an earlier level (cap binding below
    the touch) is skipped, not merged. Size is ``clip * decay**k * scale``, floored to 0.01, limited
    by the remaining room and the remaining cash, and dropped if below ``market.min_order_size``.
-   Cash is allocated sequentially (UP level 0, 1, ..., then DOWN level 0, 1, ...), charging
+   Cash is a shared, possibly binding budget, handed out in priority order and charged
    ``price * size`` plus any positive maker fee, so the emitted bids never cost more than
-   ``cash_budget``.
+   ``cash_budget``. Priority: (a) a token that completes pairs (it reduces risk and locks the
+   pair profit) is funded first, all of its levels; (b) the other tokens are then funded level by
+   level (every token's level 0 before any level 1), and within a level the remaining budget is
+   split evenly (max-min fair: a bid that costs less than an equal share is funded whole and the
+   rest goes to the others). Neither the UP / DOWN label nor the ladder order therefore decides
+   who is starved: with the labels swapped the quotes are swapped too (no label tie-break; when
+   the budget cannot rest a minimum-size order on both tokens at once, neither is funded at that
+   level and the cash stays for deeper, cheaper levels). When the budget does not bind nothing
+   changes: each token gets its own ladder. The returned list is always UP's levels (level 0
+   first) then DOWN's.
 5. No quotes in WARMUP / FLATTEN / DONE, with an empty / crossed / too wide book, or for a token
    with no cap (invalid model and nothing to complete). In WIND_DOWN a token is quoted only if it
    completes pairs (room limited to the unpaired amount) or is the favoured token (room limited to
@@ -49,7 +58,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from abc_trading.config import BotConfig
 from abc_trading.fees import FeeModel
@@ -101,7 +110,7 @@ def _sign(token: Outcome) -> float:
     return 1.0 if token is Outcome.UP else -1.0
 
 
-def _is_completing(inv: MarketInventory, token: Outcome) -> bool:
+def is_completing(inv: MarketInventory, token: Outcome) -> bool:
     """True iff buying ``token`` completes pairs: unpaired opposite inventory is held."""
     return inv.qty[token.opposite] > inv.qty[token] + EPS
 
@@ -134,7 +143,7 @@ def max_bid_for_token(
     """
     target = effective_target(fair=fair, cfg=cfg, target_net=target_net)
     margin = cfg.pair.target_margin
-    if _is_completing(inv, token):
+    if is_completing(inv, token):
         avg_other = inv.avg_cost(token.opposite)
         if avg_other is None:
             return None
@@ -206,7 +215,7 @@ def _plan_token(
     if best_ask is None or cap is None:
         return blocked
     target = effective_target(fair=fair, cfg=cfg, target_net=target_net)
-    completing = _is_completing(inv, token)
+    completing = is_completing(inv, token)
     favoured = _is_favoured(inv, token, target)
     if phase is Phase.WIND_DOWN and not (completing or favoured):
         return blocked
@@ -254,6 +263,112 @@ def _fit_size(want: float, price: float, room: float, budget: float, fees: FeeMo
     return 0.0
 
 
+@dataclass(slots=True)
+class _Ladder:
+    """One token's ladder while the cash budget is handed out (mutated level by level)."""
+
+    token: Outcome
+    cap: float
+    skew_ticks: float
+    size_scale: float
+    best_bid: float
+    best_ask: float
+    room: float  # shares still allowed to rest on this token
+    seen: set[float] = field(default_factory=set)
+    done: bool = False  # a level fell below one tick: deeper levels only get cheaper
+    levels: list[QuoteLevel] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _Bid:
+    """A ladder level wanting cash: ``demand`` shares at ``price`` (before the budget)."""
+
+    ladder: _Ladder
+    price: float
+    demand: float
+
+
+def _level_bids(
+    ladders: list[_Ladder], k: int, cfg: BotConfig, tick: float, min_size: float, clip: float
+) -> list[_Bid]:
+    """The bids ladder level ``k`` would like to rest, per token, before the cash budget."""
+    sizing = cfg.sizing
+    bids: list[_Bid] = []
+    for ladder in ladders:
+        if ladder.done:
+            continue
+        raw = min(
+            ladder.cap,
+            ladder.best_bid - k * sizing.ladder_spacing_ticks * tick,
+            ladder.best_ask - tick,
+            1.0 - tick,
+        )
+        price = floor_price(raw - ladder.skew_ticks * tick, tick)
+        if price < tick - EPS:
+            ladder.done = True  # deeper levels only get cheaper
+            continue
+        if price in ladder.seen:
+            continue
+        demand = floor_size(
+            min(clip * sizing.ladder_size_decay**k * ladder.size_scale, ladder.room)
+        )
+        if demand < min_size - EPS or demand <= EPS:
+            continue
+        bids.append(_Bid(ladder, price, demand))
+    return bids
+
+
+def _rests(size: float, min_size: float) -> bool:
+    """True iff an order of ``size`` shares is big enough to rest (``min_size`` or the 0.01 lot)."""
+    return size >= min_size - EPS and size > EPS
+
+
+def _rest(bid: _Bid, size: float, fees: FeeModel) -> float:
+    """Emit ``size`` shares for ``bid`` and return what they cost."""
+    ladder = bid.ladder
+    ladder.levels.append(QuoteLevel(ladder.token, bid.price, size))
+    ladder.seen.add(bid.price)
+    ladder.room -= size
+    return _bid_cost(fees, bid.price, size)
+
+
+def _fund_level(bids: list[_Bid], budget: float, fees: FeeModel, min_size: float) -> float:
+    """Hand ``budget`` out among the bids of one ladder level and return what is left.
+
+    Max-min fair, with no UP / DOWN tie-break: a bid that costs no more than an equal share of
+    what is left is funded whole (it needs less than its share); the others split the remainder
+    equally. A bid that cannot rest (its share, or even the whole budget, buys less than the
+    minimum order size) is dropped and releases its share. When every bid could rest alone but
+    none can on an equal share, none is funded at this level: the cash stays for the deeper,
+    cheaper levels instead of going to whichever token happens to be listed first.
+    """
+    pending = bids
+    while pending and budget > 0.0:
+        share = budget / len(pending)
+        fits = [_fit_size(b.demand, b.price, math.inf, share, fees) for b in pending]
+        whole = [i for i, b in enumerate(pending) if fits[i] >= b.demand - EPS]
+        if whole:
+            budget -= math.fsum(_rest(pending[i], fits[i], fees) for i in whole)
+            pending = [b for i, b in enumerate(pending) if i not in whole]
+            continue
+        viable = [i for i, size in enumerate(fits) if _rests(size, min_size)]
+        if len(viable) == len(pending):  # all budget-limited, all can rest: the equal split
+            spent = math.fsum(_rest(b, size, fees) for b, size in zip(pending, fits, strict=True))
+            return max(0.0, budget - spent)
+        if viable:  # the others cannot rest on a share and release it
+            pending = [pending[i] for i in viable]
+            continue
+        alone = [
+            b
+            for b in pending
+            if _rests(_fit_size(b.demand, b.price, math.inf, budget, fees), min_size)
+        ]
+        if len(alone) == len(pending):
+            break  # each could rest alone but no equal share can rest any: none at this level
+        pending = alone
+    return max(0.0, budget)
+
+
 def compute_quotes(
     *,
     snap: MarketSnapshot,
@@ -270,8 +385,9 @@ def compute_quotes(
     """Desired post-only bid ladder (see the module docstring), UP then DOWN, level 0 first.
 
     ``clip_shares`` is the size of level 0 (before decay and scaling); ``cash_budget`` bounds the
-    total cost of all returned levels. ``skip_tokens`` are not quoted and use no budget. Raises
-    ValueError on non-finite or non-positive ``clip_shares``, negative or non-finite
+    total cost of all returned levels and is handed out completing-token first, then level by
+    level and evenly between the other tokens. ``skip_tokens`` are not quoted and use no budget.
+    Raises ValueError on non-finite or non-positive ``clip_shares``, negative or non-finite
     ``cash_budget``, or non-finite ``target_net``. Returns [] when nothing may be quoted.
     """
     if not (math.isfinite(clip_shares) and clip_shares > 0.0):
@@ -284,11 +400,7 @@ def compute_quotes(
         return []
 
     plans = plan_tokens(snap=snap, fair=fair, inv=inv, phase=phase, cfg=cfg, target_net=target_net)
-    sizing = cfg.sizing
-    tick = snap.market.tick_size
-    min_size = snap.market.min_order_size
-    budget = cash_budget
-    out: list[QuoteLevel] = []
+    ladders: list[_Ladder] = []
     for token in _TOKENS:
         plan = plans[token]
         book = snap.book(token)
@@ -297,26 +409,20 @@ def compute_quotes(
             continue
         if best_bid is None or best_ask is None:
             continue
-        room = plan.room
-        seen: set[float] = set()
-        for k in range(sizing.ladder_levels):
-            raw = min(
-                plan.cap,
-                best_bid - k * sizing.ladder_spacing_ticks * tick,
-                best_ask - tick,
-                1.0 - tick,
+        ladders.append(
+            _Ladder(
+                token, plan.cap, plan.skew_ticks, plan.size_scale, best_bid, best_ask, plan.room
             )
-            price = floor_price(raw - plan.skew_ticks * tick, tick)
-            if price < tick - EPS:
-                break  # deeper levels only get cheaper
-            if price in seen:
-                continue
-            want = clip_shares * sizing.ladder_size_decay**k * plan.size_scale
-            size = _fit_size(want, price, room, budget, fees)
-            if size < min_size - EPS or size <= EPS:
-                continue
-            seen.add(price)
-            out.append(QuoteLevel(token, price, size))
-            room -= size
-            budget -= _bid_cost(fees, price, size)
-    return out
+        )
+
+    tick, min_size = snap.market.tick_size, snap.market.min_order_size
+    budget = cash_budget
+    completing = [lad for lad in ladders if is_completing(inv, lad.token)]
+    others = [lad for lad in ladders if not is_completing(inv, lad.token)]
+    for group in (completing, others):  # the pair-completing token gets cash first
+        for k in range(cfg.sizing.ladder_levels):
+            if budget <= 0.0:
+                break  # nothing left to hand out
+            bids = _level_bids(group, k, cfg, tick, min_size, clip_shares)
+            budget = _fund_level(bids, budget, fees, min_size)
+    return [q for lad in ladders for q in lad.levels]

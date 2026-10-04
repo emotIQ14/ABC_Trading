@@ -3,7 +3,14 @@
 ``format_report`` returns aligned plain text. Its headline block always says what the numbers
 are: a result whose ``source_label`` contains "synthetic" carries the banner ``SYNTHETIC DATA -
 mechanics validation only, not evidence of profitability``. Every other source still gets a
-caveat, because fees, model weights and the paper fill model are uncalibrated placeholders.
+caveat, because fees, model weights and the paper fill model are uncalibrated placeholders. A
+paper source additionally says that its data path is UNVERIFIED and its winners are inferred.
+
+A run that ends with unresolved markets (``paper``, ``replay --allow-unresolved``) is labelled as
+such where it matters: the invariants row says that invariant 4 was not checked, the result block
+names the unrealised (mark-to-mid) part of Total PnL, the per-market statistics are marked as
+covering the resolved markets only while the PnL rows cover every market (they add up to Total
+PnL with the unrealised row), and "unhedged at close" becomes "at close or stream end".
 
 ``write_run_dir`` writes ``result.json``, ``config.json``, ``fills.csv``, ``markets.csv`` and
 ``equity.csv`` (UTF-8, ``\\n`` line endings, full float precision, empty cell for None). The
@@ -27,6 +34,10 @@ PAPER_BANNER = (
     "PAPER MODE - live public data with SIMULATED fills; no order was or can be placed on any "
     "exchange. Not evidence of profitability."
 )
+PAPER_UNVERIFIED_NOTE = (
+    "Data client UNVERIFIED against the live endpoints; market winners are INFERRED from "
+    "Binance/Coinbase spot prices, not read from Polymarket's resolution."
+)
 GENERIC_NOTE = (
     "Source not marked synthetic. Results depend entirely on the data and on the paper "
     "exchange's fill model; fees and model weights are uncalibrated placeholders. "
@@ -43,12 +54,17 @@ def is_synthetic(source_label: str) -> bool:
     return "synthetic" in source_label.lower()
 
 
+def is_paper(source_label: str) -> bool:
+    """True iff the label marks a ``paper`` (live public data, simulated fills) run."""
+    return source_label.lower().startswith("paper")
+
+
 def headline_banner(source_label: str) -> str:
-    """The honesty statement that opens every report for this kind of source."""
+    """The honesty statement (one or two lines) that opens every report for this kind of source."""
     if is_synthetic(source_label):
         return SYNTHETIC_BANNER
-    if source_label.lower().startswith("paper"):
-        return PAPER_BANNER
+    if is_paper(source_label):
+        return PAPER_BANNER + "\n" + PAPER_UNVERIFIED_NOTE
     return GENERIC_NOTE
 
 
@@ -69,6 +85,15 @@ def _signed(x: float | None, digits: int = 2) -> str:
 
 def _pct(x: float | None, digits: int = 1) -> str:
     return "n/a" if x is None else f"{100.0 * x:.{digits}f}%"
+
+
+def _unresolved(n: int) -> str:
+    return f"{n} unresolved market" + ("" if n == 1 else "s")
+
+
+def _end_word(r: BacktestResult) -> str:
+    """Where inventory is measured: at resolution, or (open markets) when the stream ended."""
+    return "close or stream end" if r.unresolved_markets else "close"
 
 
 def _section(title: str, rows: Sequence[tuple[str, str]]) -> list[str]:
@@ -146,7 +171,7 @@ def format_report(result: BacktestResult) -> str:
     lines += _counters("Exchange counters", result.exchange_stats)
     lines += _counters("Runner counters", result.runner_stats)
     lines += _markets_block(result)
-    lines += _caveats()
+    lines += _caveats(result.source_label)
     return "\n".join(lines) + "\n"
 
 
@@ -158,20 +183,42 @@ def _run_rows(r: BacktestResult) -> list[tuple[str, str]]:
             f"{r.n_events:,} ({r.n_snapshots:,} snapshots, {r.n_resolutions:,} resolutions)",
         ),
         ("Time span (unix s)", f"{_num(r.first_ts, 0)} .. {_num(r.last_ts, 0)}"),
-        (
-            "Invariants",
-            "checked (DESIGN section 7, 1-4)" if r.invariants_checked else "NOT checked",
-        ),
+        ("Invariants", _invariants_label(r)),
         ("Unresolved markets", str(len(r.unresolved_markets)) if r.unresolved_markets else "none"),
     ]
 
 
+def _invariants_label(r: BacktestResult) -> str:
+    """Which DESIGN section 7 invariants ran. Invariant 4 (every market settled, nothing open,
+    PnL breakdown equals final equity) cannot hold while markets are unresolved, so a run that
+    was allowed to end that way only had 1-3 checked."""
+    if not r.invariants_checked:
+        return "NOT checked"
+    if r.unresolved_markets:
+        return (
+            f"checked 1-3; 4 (final accounting) skipped: {_unresolved(len(r.unresolved_markets))}"
+        )
+    return "checked (DESIGN section 7, 1-4)"
+
+
 def _result_rows(r: BacktestResult) -> list[tuple[str, str]]:
     p = r.pnl
+    unrealised = (
+        [
+            (
+                "Of which unrealised",
+                f"{_signed(p.pnl_unrealised)}  (open inventory of "
+                f"{_unresolved(len(r.unresolved_markets))}, marked at the last mids)",
+            )
+        ]
+        if r.unresolved_markets
+        else []
+    )
     return [
         ("Initial cash", _num(r.initial_cash)),
         ("Final equity", _num(r.final_equity)),
         ("Total PnL", f"{_signed(r.total_pnl)}  ({_signed(r.pnl_pct_of_initial_cash)}%)"),
+        *unrealised,
         (
             "Max drawdown",
             f"{_num(p.max_drawdown_usd)}  ({_pct(p.max_drawdown_frac, 2)} of peak; "
@@ -183,16 +230,33 @@ def _result_rows(r: BacktestResult) -> list[tuple[str, str]]:
 
 def _pnl_rows(r: BacktestResult) -> list[tuple[str, str]]:
     p = r.pnl
+    n_all = r.pairs.n_markets
+    scope = (
+        [
+            (
+                "Statistics cover",
+                f"resolved markets only ({p.n_markets_resolved} of {n_all}); "
+                f"the PnL rows below cover all {n_all}",
+            )
+        ]
+        if r.unresolved_markets
+        else []
+    )
     return [
-        ("Markets resolved", f"{p.n_markets_resolved} ({r.pairs.n_markets_traded} traded)"),
+        (
+            "Markets resolved",
+            f"{p.n_markets_resolved} of {n_all} ({p.n_markets_resolved_traded} traded)",
+        ),
         ("Mean / std per market", f"{_signed(p.mean_market_pnl)} / {_num(p.std_market_pnl)}"),
         ("Sharpe-like (mean/std*sqrt(n))", _signed(p.sharpe_like)),
         ("Best / worst market", f"{_signed(p.best_market_pnl)} / {_signed(p.worst_market_pnl)}"),
         ("Win rate (traded markets)", _pct(p.win_rate_traded)),
+        *scope,
         ("PnL from merges", _signed(p.pnl_merge)),
         ("PnL from sells (flatten)", _signed(p.pnl_sell)),
         ("PnL at settlement, pairs", _signed(p.pnl_settle_pair)),
         ("PnL at settlement, directional", _signed(p.pnl_settle_directional)),
+        ("Unrealised, open inventory at mid", _signed(p.pnl_unrealised)),
         ("Fees paid (inside the above)", _num(p.fees_paid)),
     ]
 
@@ -222,18 +286,24 @@ def _pair_rows(r: BacktestResult) -> list[tuple[str, str]]:
     )
     max_inv = max((m.max_inventory_shares for m in r.markets), default=0.0)
     max_net = max((m.max_net_shares for m in r.markets), default=0.0)
+    end = _end_word(r)
+    unhedged = (
+        "Markets unhedged at close or stream end (>=1 share)"
+        if r.unresolved_markets
+        else "Markets ending unhedged (>=1 share)"
+    )
     return [
         ("Shares bought", _num(s.shares_bought, 1)),
         (
             "Pairs formed",
-            f"{_num(s.pairs_formed, 1)} (merged {_num(s.merged_pairs, 0)}, held at close "
+            f"{_num(s.pairs_formed, 1)} (merged {_num(s.merged_pairs, 0)}, held at {end} "
             f"{_num(s.paired_at_close, 1)})",
         ),
         ("Pair completion rate", _pct(s.pair_completion_rate)),
         ("Avg all-in cost per merged pair", merged_cost),
-        ("Avg cost per pair held at close", _num(s.avg_close_pair_cost, 4)),
+        (f"Avg cost per pair held at {end}", _num(s.avg_close_pair_cost, 4)),
         (
-            "Markets ending unhedged (>=1 share)",
+            unhedged,
             f"{s.n_markets_unhedged} of {s.n_markets} ({_pct(s.frac_markets_unhedged)}); "
             f"of traded: {_pct(s.frac_traded_markets_unhedged)}",
         ),
@@ -267,20 +337,35 @@ def _markets_block(r: BacktestResult) -> list[str]:
     if len(r.markets) > len(shown):
         lines.append(f"  ... {len(r.markets) - len(shown)} more (see markets.csv)")
     if any(m.ended_unhedged for m in shown):
-        lines.append("  * unpaired inventory of at least 1 share remained at resolution")
+        note = "  * unpaired inventory of at least 1 share remained at resolution"
+        if any(m.ended_unhedged and not m.resolved for m in shown):
+            note += " (unresolved markets: at the end of the stream)"
+        lines.append(note)
     return lines
 
 
-def _caveats() -> list[str]:
-    return [
+def _caveats(source_label: str) -> list[str]:
+    lines = [
         "",
         "Caveats",
         "-------",
-        "  * Fee parameters, model weights and strategy thresholds are uncalibrated defaults.",
-        "  * The paper exchange fill model is conservative by design but not validated against",
+        "  * Fee parameters are placeholders, not Polymarket's verified fee schedule; model",
+        "    weights and strategy thresholds are uncalibrated.",
+        "  * The paper exchange fill model (queue, latency of orders and cancels) is an",
+        "    assumption: pessimistic in places, optimistic in others, and not validated against",
         "    real order books or queues.",
-        "  * No live trading exists in this project: nothing here places or signs real orders.",
     ]
+    if is_paper(source_label):
+        lines += [
+            "  * The paper data path has never been checked against the live services: the",
+            "    endpoints, field names, market slugs and the price-to-beat rule are guesses, and",
+            "    market winners are inferred from Binance/Coinbase spot prices, not read from",
+            "    Polymarket's resolution. PnL of a market that has not resolved is marked at mid.",
+        ]
+    lines.append(
+        "  * No live trading exists in this project: nothing here places or signs real orders."
+    )
+    return lines
 
 
 # --------------------------------------------------------------------------- run directory

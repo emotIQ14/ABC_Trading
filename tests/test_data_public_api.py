@@ -8,12 +8,15 @@ the parsing logic, NOT that the real Polymarket / Binance / Coinbase endpoints l
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import io
 import json
 import os
+import socket
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -169,6 +172,15 @@ def test_malformed_market_payloads_raise_data_error(payload: Any, match: str) ->
     client, _ = poly({GAMMA_URL: payload})
     with pytest.raises(DataError, match=match):
         client.market_by_slug("btc-updown-5m-1704067200")
+
+
+def test_json_string_field_nested_too_deeply_is_a_data_error() -> None:
+    # json.loads raises RecursionError (not ValueError) on this; the contract is DataError only
+    deep = "[" * 100_000 + "]" * 100_000
+    for field in ("outcomes", "clobTokenIds"):
+        client, _ = poly({GAMMA_URL: with_market(**{field: deep})})
+        with pytest.raises(DataError, match=rf"{field}: .*nested too deeply"):
+            client.market_by_slug("btc-updown-5m-1704067200")
 
 
 def test_market_times_accept_millis_numeric_strings_and_naive_iso() -> None:
@@ -377,6 +389,57 @@ def test_unmappable_records_are_skipped_and_counted() -> None:
     assert client.stats["trades_skipped"] == 6
 
 
+def trade_rec(**changes: Any) -> dict[str, Any]:
+    """A valid trade record on the Up token (``None`` removes a field)."""
+    rec: dict[str, Any] = {
+        "side": "BUY", "asset": UP_ID, "conditionId": "0xabc123", "outcome": "Up", "size": 2,
+        "price": 0.5, "timestamp": 10, "transactionHash": "0xt",
+    }  # fmt: skip
+    for key, value in changes.items():
+        if value is None:
+            rec.pop(key, None)
+        else:
+            rec[key] = value
+    return rec
+
+
+@pytest.mark.parametrize("tx", [["0xdead"], {"hash": "0xdead"}, [[["deep"]]], 1.5, True], ids=repr)
+def test_unusable_transaction_hash_is_skipped_and_counted(tx: Any) -> None:
+    # An unhashable hash used to raise TypeError out of recent_trades (and out of `paper`).
+    client, _ = trades_client([trade_rec(transactionHash=tx), trade_rec(timestamp=11)])
+    got = client.recent_trades("0xabc123", 0.0)
+    assert [t.ts for t in got] == [11.0, 11.0]  # the good record survives, with its mirror
+    assert client.stats == {"trades_skipped": 1, "trades_duplicate": 0}
+
+
+@pytest.mark.parametrize("tx", ["0xabc", 12345, None], ids=repr)
+def test_string_integer_and_missing_transaction_hashes_dedupe_across_calls(tx: Any) -> None:
+    client, _ = trades_client([trade_rec(transactionHash=tx)])
+    assert len(client.recent_trades("0xabc123", 0.0)) == 2
+    assert client.recent_trades("0xabc123", 0.0) == []
+    assert client.stats == {"trades_skipped": 0, "trades_duplicate": 1}
+
+
+# JSON values of every type (and the awkward floats Python's decoder accepts).
+ODD_VALUES: list[Any] = [
+    [], ["x"], {}, {"a": [1]}, [[[]]], True, False, "", " ", "x", "0x1", 0, -1, 1.5,
+    float("inf"), float("nan"), 10**400, "1e999", "NaN", "9999-12-31T23:59:59-23:59",
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["side", "asset", "conditionId", "price", "size", "timestamp", "outcome", "transactionHash"],
+)
+@pytest.mark.parametrize("value", ODD_VALUES, ids=lambda v: repr(v)[:24])
+def test_any_json_value_in_a_trade_field_is_accepted_or_skipped_never_raised(
+    field: str, value: Any
+) -> None:
+    client, _ = trades_client([trade_rec(**{field: value})])
+    got = client.recent_trades("0xabc123", -1e9)  # must not raise (a ts of -1 is not filtered)
+    assert client.stats["trades_skipped"] + len(got) // 2 == 1  # exactly one of the two
+
+
 def test_millisecond_trade_timestamps_are_converted() -> None:
     rec = {"side": "BUY", "asset": UP_ID, "size": 2, "price": 0.5, "timestamp": 1704067210123}
     client, _ = trades_client([rec])
@@ -563,6 +626,36 @@ def test_invalid_symbol_and_product_rejected() -> None:
     assert fake.calls == []
 
 
+# ------------------------------------------------------------- the DataError-only contract
+
+
+def only_data_error(call: Callable[..., Any], *args: Any) -> None:
+    with contextlib.suppress(DataError):  # any other exception type fails the test
+        call(*args)
+
+
+@pytest.mark.parametrize("value", ODD_VALUES, ids=lambda v: repr(v)[:24])
+def test_odd_json_values_in_market_book_and_spot_payloads_never_escape_as_other_errors(
+    value: Any,
+) -> None:
+    fields = ("conditionId", "outcomes", "clobTokenIds", "eventStartTime", "endDate",
+              "orderPriceMinTickSize", "orderMinSize", "slug")  # fmt: skip
+    for field in fields:
+        client, _ = poly({GAMMA_URL: with_market(**{field: value})})
+        only_data_error(client.market_by_slug, "btc-updown-5m-1704067200")
+    books = ({"bids": value}, {"asks": [value]}, {"bids": [{"price": value, "size": 1}]},
+             {"bids": [{"price": 0.5, "size": value}]}, value)  # fmt: skip
+    for payload in books:
+        client, _ = poly({CLOB_URL: payload})
+        only_data_error(client.book, "1", Outcome.UP)
+    both_venues = {BINANCE_URL: {"price": value}, COINBASE_URL: {"data": {"amount": value}}}
+    spot, _ = spot_client(both_venues)
+    only_data_error(spot.spot, "BTC")
+    for payload in (value, [value], {"data": value}):
+        client, _ = poly({DATA_URL: payload})
+        only_data_error(client.recent_trades, "0xabc123", 0.0)
+
+
 # ------------------------------------------------------------------ UrllibTransport (fakes)
 
 
@@ -656,6 +749,17 @@ def test_urllib_transport_invalid_json_body(body: bytes) -> None:
         transport.get_json("https://example.test/p")
 
 
+@pytest.mark.parametrize("opening", [b"[", b'{"a":'], ids=["arrays", "objects"])
+@pytest.mark.parametrize("depth", [2_000, 200_000])
+def test_urllib_transport_deeply_nested_json_is_a_data_error(opening: bytes, depth: int) -> None:
+    # json.loads raises RecursionError (not ValueError) on this; the contract is DataError only.
+    closing = b"]" if opening == b"[" else b"}"
+    body = opening * depth + closing * depth  # far below the 8 MiB cap even at depth 200_000
+    transport = UrllibTransport(opener=FakeOpener(body))
+    with pytest.raises(DataError, match="invalid JSON from https://example.test/p"):
+        transport.get_json("https://example.test/p")
+
+
 def test_urllib_transport_caps_response_size() -> None:
     transport = UrllibTransport(opener=FakeOpener(b'["' + b"x" * 20 + b'"]'), max_bytes=10)
     with pytest.raises(DataError, match="exceeds 10 bytes"):
@@ -700,6 +804,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, body)
         elif self.path.startswith("/badjson"):
             self._send(200, b"<html>not json</html>")
+        elif self.path.startswith("/redirect"):
+            target = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)["to"][0]
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         else:
             self._send(404, b'{"error": "not found"}')
 
@@ -755,6 +865,80 @@ def test_loopback_connection_refused_is_data_error(loopback: str) -> None:
     dead = "http://127.0.0.1:1"  # port 1: nothing listens
     with pytest.raises(DataError, match="network error|connection error"):
         UrllibTransport(opener=direct_opener()).get_json(dead + "/x", timeout=2.0)
+
+
+class ConnectionTrap:
+    """A listening socket standing in for a non-http(s) server: did anything connect to it?"""
+
+    def __init__(self) -> None:
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(5)
+        self._sock.setblocking(False)
+        self.port: int = self._sock.getsockname()[1]
+
+    def connected(self) -> bool:
+        try:
+            conn, _ = self._sock.accept()
+        except BlockingIOError:
+            return False
+        conn.close()
+        return True
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+@pytest.fixture
+def trap() -> Iterator[ConnectionTrap]:
+    t = ConnectionTrap()
+    try:
+        yield t
+    finally:
+        t.close()
+
+
+@pytest.mark.parametrize("scheme", ["ftp", "file", "data"])
+def test_redirect_to_a_non_http_url_is_refused_and_never_opened(
+    scheme: str, loopback: str, trap: ConnectionTrap, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_proxy_env(monkeypatch)
+    target = {
+        "ftp": f"ftp://127.0.0.1:{trap.port}/x.json",
+        "file": "file:///etc/hostname",
+        "data": "data:application/json,[]",
+    }[scheme]
+    with pytest.raises(DataError, match="refusing redirect|HTTP 302") as info:
+        UrllibTransport().get_json(loopback + "/redirect", {"to": target}, timeout=1.0)
+    assert not trap.connected()  # the default opener never dialled the redirect target
+    assert "x.json" not in str(info.value) and "hostname" not in str(info.value)
+
+
+def test_redirects_between_http_urls_are_still_followed(
+    loopback: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_proxy_env(monkeypatch)
+    transport = UrllibTransport()
+    out = transport.get_json(loopback + "/redirect", {"to": "/echo?via=redirect"}, timeout=5.0)
+    assert out["path"] == "/echo?via=redirect"
+    out = transport.get_json(loopback + "/redirect", {"to": loopback + "/echo"}, timeout=5.0)
+    assert out["path"] == "/echo"
+
+
+def test_default_opener_speaks_only_http_and_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("ftp_proxy", "http://127.0.0.1:1")  # must not make ftp:// openable
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:1")
+    opener = api._http_only_opener()
+    banned = (
+        urllib.request.FTPHandler, urllib.request.FileHandler, urllib.request.DataHandler,
+    )  # fmt: skip
+    assert not [h for h in opener.handlers if isinstance(h, banned)]
+    for url in ("ftp://127.0.0.1:1/x", "file:///etc/hostname", "data:application/json,[]"):
+        with pytest.raises(urllib.error.URLError, match="unknown url type"):
+            opener.open(url, timeout=1.0)
+    proxies = [h for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert [sorted(h.proxies) for h in proxies] == [["https"]]  # only http(s) proxies are kept
 
 
 def clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:

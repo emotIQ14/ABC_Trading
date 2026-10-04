@@ -11,6 +11,7 @@ poll = 100 s, so ticks fall at T0, T0+100, T0+200, T0+300 (= next window start),
 from __future__ import annotations
 
 import dataclasses
+import io
 import json
 import math
 from collections import Counter
@@ -20,10 +21,16 @@ from typing import Any
 
 import pytest
 
+from abc_trading import cli
 from abc_trading.config import BotConfig, SimConfig
 from abc_trading.data.events import event_to_dict, read_jsonl
 from abc_trading.data.live import STAT_KEYS, LiveFeed, record
-from abc_trading.data.public_api import DataError, PolymarketPublicClient, SpotClient
+from abc_trading.data.public_api import (
+    DataError,
+    PolymarketPublicClient,
+    SpotClient,
+    UrllibTransport,
+)
 from abc_trading.types import (
     BookSnapshot,
     FeedEvent,
@@ -401,6 +408,65 @@ def test_non_data_errors_propagate() -> None:
     with pytest.raises(RuntimeError, match="bug"):
         next(feed)
     assert feed.stats["errors"] == 0
+
+
+def test_unusable_trade_record_is_skipped_and_counted_and_the_feed_keeps_running() -> None:
+    # A list-valued transactionHash used to raise TypeError out of the client and end the feed.
+    world, clock = make_world()
+    s1 = slug_for(T0)
+    common = {"side": "BUY", "asset": f"up-{s1}", "conditionId": f"cond-{s1}", "size": 10,
+              "price": 0.45}  # fmt: skip
+    world.trades = [
+        {**common, "timestamp": T0 + 50, "transactionHash": ["not", "a", "hash"]},
+        {**common, "timestamp": T0 + 60, "transactionHash": "h2"},
+    ]
+    client = PolymarketPublicClient(world)
+    feed = LiveFeed(
+        CFG, client, SpotClient(world), assets=("BTC",), window_seconds=W, poll_seconds=100.0,
+        clock=clock.now, sleep=clock.sleep, max_events=3,
+    )  # fmt: skip
+    events = [snap(e) for e in feed]
+    assert [e.ts for e in events] == [T0, T0 + 100, T0 + 200]
+    assert events[1].trades == (  # only the usable record, once, with its mirror
+        Trade(T0 + 60, Outcome.UP, 0.45, 10.0, Side.BUY),
+        Trade(T0 + 60, Outcome.DOWN, 0.55, 10.0, Side.SELL),
+    )
+    assert events[2].trades == ()
+    assert client.stats == {"trades_skipped": 2, "trades_duplicate": 0}  # seen at T0+100, T0+200
+    assert feed.stats["errors"] == 0
+
+
+class _Body:
+    def __init__(self, body: bytes) -> None:
+        self._buf = io.BytesIO(body)
+
+    def __enter__(self) -> _Body:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def read(self, n: int = -1) -> bytes:
+        return self._buf.read(n)
+
+
+class _HostileOpener:
+    """Answers every request with a 200 whose JSON body is nested 200 000 levels deep."""
+
+    def open(self, request: object, /, *, timeout: float) -> _Body:
+        return _Body(b"[" * 200_000 + b"]" * 200_000)
+
+
+def test_paper_exits_4_with_a_message_on_an_undecodable_response_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "_make_transport", lambda: UrllibTransport(opener=_HostileOpener()))
+    code = cli.main(
+        ["paper", "--i-understand-this-is-paper-only", "--assets", "BTC", "--max-events", "5"]
+    )
+    err = capsys.readouterr().err
+    assert code == cli.EXIT_UNREACHABLE == 4
+    assert "invalid JSON" in err and "Traceback" not in err
 
 
 def test_spot_outage_at_rollover_delays_resolution() -> None:

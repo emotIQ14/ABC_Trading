@@ -195,9 +195,16 @@ def test_a_latched_kill_switch_and_a_stale_spot_stop_all_quoting_in_a_real_run()
 
 
 def test_the_audit_runs_exercise_completing_bids_taker_buys_and_flatten_sells() -> None:
-    _, audit = _run_audited(small_cfg(latency=0, seed=2))
+    """The audited run really uses the rebalancing leg, not just once: six windows give 509
+    completing bids, 19 taker completions and 8 FLATTEN sells. The floors sit near half of those,
+    so a change of model or feed has room, while an engine whose completion guard let any resting
+    bid of ours block it (3 taker completions, the rest of the run unchanged) falls below them.
+    A bare ``> 0`` passed that and a 6x loss of the rebalancing leg."""
+    _, audit = _run_audited(small_cfg(latency=0, seed=2, n_windows=6))
     assert audit.violations == []
-    assert audit.n["completing_bids"] > 0 and audit.n["ioc_buys"] > 0 and audit.n["ioc_sells"] > 0
+    assert audit.n["completing_bids"] >= 250
+    assert audit.n["ioc_buys"] >= 10
+    assert audit.n["ioc_sells"] >= 4
 
 
 # --------------------------------------------------------------------------- fills vs the feed
@@ -255,6 +262,41 @@ def test_every_fill_is_explained_by_the_feed(latency: int) -> None:
                     assert fill.price >= limit - EPS
     runner.finish()
     assert seen["maker"] >= 5 and seen["taker"] >= 1
+
+
+@pytest.mark.parametrize("latency", [0, 1, 2])
+def test_a_cancelled_order_can_fill_only_until_its_cancel_lands(latency: int) -> None:
+    """A cancel is a message like an order (DESIGN 5): a quote the engine already dropped can
+    still be hit by the prints of the next ``latency`` snapshots, never after that. With instant
+    cancels no such fill existed, which flattered fill counts and PnL."""
+    cfg = small_cfg(latency=latency, n_windows=3)
+    runner = BacktestRunner(cfg, check_invariants=True)
+    sent_at: dict[str, float] = {}
+    original = runner.exchange.cancel
+
+    def cancel(order_id: str, ts: float) -> bool:
+        accepted = original(order_id, ts)
+        if accepted:
+            sent_at[order_id] = ts
+        return accepted
+
+    runner.exchange.cancel = cancel  # type: ignore[method-assign]
+    window = latency * cfg.sim.tick_seconds
+    stale = 0
+    for event in SyntheticFeed(cfg):
+        before = len(runner._fills)
+        runner.feed(event)
+        if not isinstance(event, MarketSnapshot):
+            continue
+        for fill in runner._fills[before:]:
+            sent = sent_at.get(fill.order_id)
+            if sent is None:
+                continue
+            assert fill.ts <= sent + window + EPS, (fill, sent)  # the cancel had landed by then
+            stale += fill.ts > sent + EPS  # filled although the engine had already cancelled it
+    result = runner.finish()
+    assert result.runner_stats["cancel_misses"] == 0  # pending cancels are hidden: no re-cancels
+    assert stale == 0 if latency == 0 else stale > 0
 
 
 # --------------------------------------------------------------------------- no look-ahead

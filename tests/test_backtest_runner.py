@@ -638,6 +638,196 @@ def test_brier_uses_the_last_accumulate_snapshot_of_each_market() -> None:
     assert by_id["m3"].p_up_last_accumulate is None
 
 
+# --------------------------------------------------------------------------- UP / DOWN asymmetry
+#
+# Everything above runs on mirrored 0.50 books, where "the UP mid", "the DOWN mid" and "one minus
+# the other" are all the same number, so a report metric that read the wrong token's book, or marked
+# the tokens crosswise, was invisible. The books below do NOT mirror each other.
+
+
+def book_of(token: Outcome, bid: float, ask: float, size: float = 400.0) -> BookSnapshot:
+    return BookSnapshot(token, (Level(bid, size),), (Level(ask, size),))
+
+
+def skewed_snap(
+    ts: float,
+    up: tuple[float, float],
+    down: tuple[float, float],
+    market: MarketSpec = M1,
+    trades: Sequence[Trade] = (),
+) -> MarketSnapshot:
+    """One level per side; ``up`` and ``down`` are (bid, ask) and need not mirror each other."""
+    return MarketSnapshot(
+        ts=ts, market=market, up_book=book_of(UP, *up), down_book=book_of(DOWN, *down),
+        spot=60_000.0, spot_ts=ts, ref_price=60_000.0, trades=tuple(trades),
+    )  # fmt: skip
+
+
+def test_brier_market_scores_the_up_mid_not_the_down_mid() -> None:
+    # m1: UP 0.69/0.71 (mid 0.70), DOWN 0.29/0.31 (mid 0.30); p_up 0.8, raw model 0.75; UP wins
+    # m2: UP 0.39/0.41 (mid 0.40), DOWN 0.54/0.56 (mid 0.55): two books fetched separately need not
+    #     be complementary (0.40 + 0.55 != 1); p_up 0.3, raw model 0.35; DOWN wins
+    #   market (UP mid): ((0.70 - 1)^2 + (0.40 - 0)^2) / 2 = (0.09 + 0.16) / 2 = 0.125
+    #   engine p_up:     ((0.80 - 1)^2 + (0.30 - 0)^2) / 2 = (0.04 + 0.09) / 2 = 0.065
+    #   raw model:       ((0.75 - 1)^2 + (0.35 - 0)^2) / 2 = (0.0625 + 0.1225) / 2 = 0.0925
+    # scoring the DOWN mid instead would give ((0.30 - 1)^2 + (0.55 - 0)^2) / 2 = 0.39625
+    cfg = BotConfig()
+    runner = BacktestRunner(cfg)
+    engine = FairScriptedEngine(cfg, {})
+    runner.engine = engine
+    m2 = MarketSpec("m2", "ETH", 1000.0, 1900.0)
+    for ts, spec, up, down, fv_ in (
+        (1100.0, M1, (0.69, 0.71), (0.29, 0.31), fair(0.8, 0.75)),
+        (1101.0, m2, (0.39, 0.41), (0.54, 0.56), fair(0.3, 0.35)),
+    ):
+        engine.fairs = {ts: (Phase.ACCUMULATE, fv_)}
+        runner.feed(skewed_snap(ts, up, down, spec))
+    runner.feed(MarketResolved(1900.0, "m1", UP))
+    runner.feed(MarketResolved(1900.0, "m2", DOWN))
+    c = runner.finish().calibration
+    assert (c.n_resolved, c.n_scored) == (2, 2)
+    assert c.brier_market == pytest.approx(0.125)
+    assert c.brier_model == pytest.approx(0.065)
+    assert c.brier_model_raw == pytest.approx(0.0925)
+    assert c.skill_vs_market == pytest.approx(1.0 - 0.065 / 0.125)  # 0.48
+
+
+def test_brier_scores_of_a_real_run_match_an_independent_recomputation_from_the_feed() -> None:
+    # The run's headline calibration numbers recomputed here from the raw feed: for each market the
+    # last ACCUMULATE snapshot (DESIGN 2.6, from the timing config) with a valid fair value, the UP
+    # mid of that snapshot's book, and the winner of the MarketResolved event.
+    from abc_trading.config import SimConfig
+    from abc_trading.sim.feed import SyntheticFeed
+
+    cfg = BotConfig(sim=SimConfig(seed=2, n_windows=3, assets=("BTC",)))
+    t = cfg.timing
+    runner = BacktestRunner(cfg)
+    last: dict[str, tuple[float, float, float | None]] = {}  # market -> (p_up, p_model, up mid)
+    winners: dict[str, Outcome] = {}
+    for ev in SyntheticFeed(cfg):
+        runner.feed(ev)
+        if isinstance(ev, MarketSnapshot):
+            spec = ev.market
+            if (
+                ev.ts - spec.start_ts >= t.warmup_seconds
+                and spec.end_ts - ev.ts > t.wind_down_seconds
+            ):
+                fv_ = runner.engine.last_fair(spec.market_id)
+                assert fv_ is not None
+                valid_mid = ev.up_book.mid if fv_.valid else None  # an invalid sample is not scored
+                last[spec.market_id] = (fv_.p_up, fv_.p_up_model, valid_mid)
+        else:
+            winners[ev.market_id] = ev.winner
+    c = runner.finish().calibration
+    scored = [m for m in winners if m in last and last[m][2] is not None]
+    assert len(scored) >= 2 and c.n_scored == len(scored)
+
+    def brier(idx: int) -> float:
+        return sum(
+            ((last[m][idx] or 0.0) - (1.0 if winners[m] is UP else 0.0)) ** 2 for m in scored
+        ) / len(scored)
+
+    assert c.brier_market == pytest.approx(brier(2))
+    assert c.brier_model == pytest.approx(brier(0))
+    assert c.brier_model_raw == pytest.approx(brier(1))
+    assert abs(brier(2) - 0.25) > 1e-3  # the market mid is informative here, not a constant 0.5
+
+
+def run_held_position(token: Outcome, final: Outcome) -> tuple[BacktestResult, list[float]]:
+    """Buy 100 ``token`` at 0.69 (its own bid) on books where that token's mid is 0.70 and the
+    other's 0.30, then the mids move against the position (0.60 / 0.40), then it resolves."""
+    hi, lo = ((0.69, 0.71), (0.29, 0.31)), ((0.59, 0.61), (0.39, 0.41))
+
+    def snap_at(
+        ts: float,
+        books: tuple[tuple[float, float], tuple[float, float]],
+        trades: Sequence[Trade] = (),
+    ) -> MarketSnapshot:
+        own, other = books
+        up, down = (own, other) if token is UP else (other, own)
+        return skewed_snap(ts, up, down, trades=trades)
+
+    script: dict[tuple[str, float], list[Action]] = {
+        ("m1", 1100.0): [place("c1", token, BUY, 0.69, 100.0, POST)]
+    }
+    runner = make_runner(script, equity_sample_every=1)
+    # live at 1101 behind the 400 displayed at 0.69; a print of 5000 at 0.69 then fills all 100
+    runner.feed(snap_at(1100.0, hi))
+    runner.feed(snap_at(1101.0, hi))
+    runner.feed(snap_at(1102.0, hi, [print_(1102.0, token, 0.69, 5000.0)]))
+    runner.feed(snap_at(1103.0, lo))
+    runner.feed(MarketResolved(1900.0, "m1", final))
+    result = runner.finish()
+    return result, [p.equity for p in result.equity_curve]
+
+
+@pytest.mark.parametrize("token", [UP, DOWN])
+def test_equity_curve_marks_each_token_at_its_own_mid(token: Outcome) -> None:
+    result, curve = run_held_position(token, token)
+    # 1102: cash 10000 - 69 = 9931, and 100 shares at THEIR OWN book's mid 0.70 -> 10001 (marking
+    #       them at the other book's 0.30 would give 9961); 1103: mid 0.60 -> 9931 + 60 = 9991;
+    #       resolution, the held token wins: 9931 + 100 = 10031
+    assert curve == pytest.approx([10_000.0, 10_000.0, 10_001.0, 9_991.0, 10_031.0])
+    assert result.final_equity == pytest.approx(10_031.0)
+
+
+@pytest.mark.parametrize("token", [UP, DOWN])
+def test_max_drawdown_follows_the_own_mid_marks(token: Outcome) -> None:
+    result, _ = run_held_position(token, token)
+    assert result.pnl.peak_equity == pytest.approx(10_031.0)
+    assert result.pnl.max_drawdown_usd == pytest.approx(10.0)  # 10001 -> 9991, before the payout
+    assert result.pnl.max_drawdown_frac == pytest.approx(10.0 / 10_001.0)
+    lost, _ = run_held_position(token, token.opposite)
+    # the position loses: peak 10001, then 9991, then the settlement pays 0: 9931
+    assert lost.pnl.max_drawdown_usd == pytest.approx(70.0)
+    assert lost.pnl.peak_equity == pytest.approx(10_001.0)
+
+
+def run_pairs_held_at_close() -> BacktestResult:
+    """Buy 120 UP @ 0.49 and 100 DOWN @ 0.47, merge 30 pairs, hold the rest to resolution.
+
+    BUY UP 120@0.49 and BUY DOWN 100@0.47 go live at 1101 behind 400 displayed shares each (the
+    mirrored DOWN book has 400 at 0.47); prints of 520 and 500 drain the queue and fill them.
+    Held after the merge of 30 pairs: UP 90, DOWN 70, i.e. 70 pairs and 20 unpaired UP.
+    """
+    script: dict[tuple[str, float], list[Action]] = {
+        ("m1", 1100.0): [
+            place("c1", UP, BUY, 0.49, 120.0, POST),
+            place("c2", DOWN, BUY, 0.47, 100.0, POST),
+        ],
+        ("m1", 1102.0): [MergePairs("m1", 30.0)],
+    }
+    runner = make_runner(script)
+    for ev in (
+        snap(1100.0),
+        snap(1101.0),
+        snap(1102.0, trades=[print_(1102.0, UP, 0.49, 520.0), print_(1102.0, DOWN, 0.47, 500.0)]),
+        snap(1103.0),
+        MarketResolved(1900.0, "m1", UP),
+    ):
+        runner.feed(ev)
+    return runner.finish()
+
+
+def test_pair_metrics_of_pairs_held_to_resolution_by_hand() -> None:
+    result = run_pairs_held_at_close()
+    (m,) = result.markets
+    assert (m.buy_shares, m.merged_pairs, m.paired_at_close) == (220.0, 30.0, 70.0)
+    assert (m.unpaired_token, m.unpaired_at_close) == ("UP", pytest.approx(20.0))
+    # the 70 held pairs cost 0.49 + 0.47 = 0.96 per pair (the sum of the two average costs; a
+    # difference would be 0.02, an impossible pair cost)
+    assert m.avg_pair_cost_at_close == pytest.approx(0.96)
+    assert m.avg_merge_pair_cost == pytest.approx(0.96)  # 1 - merge pnl 1.2 / 30 pairs
+    # completion: 2 * (30 merged + 70 held) pairs = 200 shares of the 220 bought (a net of merged
+    # and held pairs would give 2 * (30 - 70) / 220 < 0)
+    assert m.pair_completion_rate == pytest.approx(200.0 / 220.0)
+    assert m.settle_pair_pnl == pytest.approx(2.8)  # 70 * (1 - 0.96)
+    p = result.pairs
+    assert (p.pairs_formed, p.paired_at_close, p.merged_pairs) == (100.0, 70.0, 30.0)
+    assert p.avg_close_pair_cost == pytest.approx(0.96)
+    assert p.pair_completion_rate == pytest.approx(200.0 / 220.0)
+
+
 # --------------------------------------------------------------------------- unresolved streams
 
 
@@ -665,6 +855,15 @@ def test_unresolved_market_allowed_is_marked_to_mid() -> None:
     assert result.total_pnl == pytest.approx(3.0)
     assert result.pnl.n_markets_resolved == 0
     assert result.calibration.n_resolved == 0
+    # the PnL decomposition covers the unresolved market too: its merge is realised pnl, and the
+    # open 20 UP are an explicit unrealised row, so the rows add up to the total pnl
+    p = result.pnl
+    assert (p.n_markets_resolved, p.n_markets_resolved_traded) == (0, 0)
+    assert p.pnl_merge == pytest.approx(2.0)
+    assert (p.pnl_sell, p.pnl_settle_pair, p.pnl_settle_directional) == (0.0, 0.0, 0.0)
+    assert p.pnl_unrealised == pytest.approx(1.0)
+    rows = p.pnl_sell + p.pnl_merge + p.pnl_settle_pair + p.pnl_settle_directional
+    assert rows + p.pnl_unrealised == pytest.approx(result.total_pnl, abs=1e-9)
 
 
 def test_unresolved_market_without_invariant_checks_is_accepted() -> None:
@@ -874,16 +1073,64 @@ def test_invariant_4_stray_order_in_a_resolved_market_is_detected() -> None:
         runner.finish()
 
 
-def test_final_accounting_failure_is_detected_at_the_end() -> None:
+def test_cash_corruption_both_sides_agree_on_is_caught_by_the_realised_pnl_identity() -> None:
     runner = make_runner({})
     runner.feed(snap(1100.0))
     runner.feed(MarketResolved(1900.0, "m1", UP))
-    # both sides agree on the corrupted cash, so only the end-of-run identities can notice
+    # both sides agree on the corrupted cash, so reconciliation (1) cannot notice; the end-of-run
+    # sweep does, by invariant 2 (cash + capital - initial == realised pnl), which runs BEFORE the
+    # final accounting identity of invariant 4 and therefore always fires first for this fault
     runner.engine.portfolio.cash += 0.5
     assert isinstance(runner.exchange, SpyExchange)
     runner.exchange._cash += 0.5  # fault injection
-    with pytest.raises(InvariantError, match="invariant (2|4)"):
+    with pytest.raises(InvariantError, match=r"invariant 2 \(realised-pnl identity\)"):
         runner.finish()
+
+
+def _resolved_runner() -> BacktestRunner:
+    runner = make_runner({})
+    runner.feed(snap(1100.0))
+    runner.feed(MarketResolved(1900.0, "m1", UP))
+    return runner
+
+
+def _corrupt_recorded_total(runner: BacktestRunner, delta: float) -> None:
+    """Shift only the PnLBreakdown total the runner recorded at settlement: cash, positions and
+    the realised-pnl identity stay exact, so invariants 1-3 cannot see it."""
+    track = runner._tracks["m1"]
+    assert track.breakdown is not None
+    track.breakdown = replace(track.breakdown, total=track.breakdown.total + delta)
+
+
+@pytest.mark.parametrize("delta", [0.5, -0.5, 1e-3, -1e-3, 5e-6])
+def test_final_accounting_identity_is_checked_by_invariant_4_itself(delta: float) -> None:
+    # DESIGN 7.4: sum(PnLBreakdown.total) == final cash - initial cash (<= 1e-6). Only the recorded
+    # totals are wrong here, so only this check can fail, and it must name itself. The sizes
+    # cover a gross error, one far below a cent and one just above the 1e-6 tolerance.
+    runner = _resolved_runner()
+    _corrupt_recorded_total(runner, delta)
+    with pytest.raises(
+        InvariantError, match=r"invariant 4 \(final accounting\) violated at end of"
+    ):
+        runner.finish()
+
+
+def test_final_accounting_identity_tolerates_float_noise_below_the_tolerance() -> None:
+    runner = _resolved_runner()
+    _corrupt_recorded_total(runner, 1e-9)
+    result = runner.finish()  # 1e-9 << 1e-6: no violation
+    assert result.invariants_checked is True
+    assert result.total_pnl == pytest.approx(0.0, abs=1e-9)
+
+
+def test_final_accounting_message_reports_both_sums() -> None:
+    runner = _resolved_runner()
+    _corrupt_recorded_total(runner, 0.5)
+    with pytest.raises(InvariantError) as err:
+        runner.finish()
+    msg = str(err.value)
+    assert "sum of PnLBreakdown.total 0.5 != final equity - initial cash 0" in msg
+    assert "diff 0.5" in msg
 
 
 def test_engine_rejecting_an_exchange_fill_is_an_invariant_violation() -> None:
@@ -1047,18 +1294,23 @@ def test_pnl_stats_by_hand() -> None:
         rec(n_fills=1, pnl=-4.0, merge_pnl=1.0, sell_pnl=-6.0, settle_pair_pnl=0.0,
             settle_directional_pnl=1.0, fees_paid=0.25),
         rec(n_fills=1, pnl=2.0, merge_pnl=2.0, fees_paid=0.25),
-        rec(n_fills=1, resolved=False, pnl=3.0, merge_pnl=3.0),  # unresolved: excluded
+        # unresolved: left out of the per-market statistics (its pnl is only the realised part so
+        # far) but counted in the decomposition sums, which are realised pnl of every market
+        rec(n_fills=1, resolved=False, pnl=3.0, merge_pnl=3.0, fees_paid=0.5),
     ]  # fmt: skip
     s = pnl_stats(records, [10_000.0, 10_050.0, 9_950.0, 10_010.0], 10_000.0)
-    assert s.n_markets_resolved == 3
+    assert (s.n_markets_resolved, s.n_markets_resolved_traded) == (3, 3)
     assert s.mean_market_pnl == pytest.approx(8.0 / 3.0)  # (10 - 4 + 2) / 3
     assert s.std_market_pnl == pytest.approx(math.sqrt(148.0 / 3.0))  # sum sq dev 296/3, /2
     assert s.sharpe_like == pytest.approx(4.0 / math.sqrt(37.0))  # 8 / sqrt(148)
     assert (s.best_market_pnl, s.worst_market_pnl) == (10.0, -4.0)
     assert s.win_rate_traded == pytest.approx(2.0 / 3.0)
-    assert (s.pnl_merge, s.pnl_sell) == (10.0, -5.0)
+    assert (s.pnl_merge, s.pnl_sell) == (13.0, -5.0)  # 7 + 1 + 2 + 3 (unresolved) and 1 - 6
     assert (s.pnl_settle_pair, s.pnl_settle_directional) == (1.0, 2.0)
-    assert s.fees_paid == pytest.approx(1.0)
+    assert s.fees_paid == pytest.approx(1.5)  # 0.5 + 0.25 + 0.25 + 0.5 (unresolved)
+    # final equity 10 010 (last curve point): gain 10, realised 10 - 4 + 2 + 3 = 11, so the open
+    # inventory is worth -1 unrealised
+    assert s.pnl_unrealised == pytest.approx(-1.0)
     # peak 10050 then 9950: depth 100 = 0.995% of the peak
     assert s.peak_equity == 10_050.0
     assert s.max_drawdown_usd == pytest.approx(100.0)
@@ -1077,8 +1329,23 @@ def test_win_rate_counts_only_strictly_profitable_traded_markets() -> None:
     assert s.n_markets_resolved == 4
 
 
+def test_pnl_stats_unrealised_is_final_equity_minus_initial_minus_realised() -> None:
+    records = [
+        rec(n_fills=1, pnl=5.0, merge_pnl=5.0),
+        rec(n_fills=1, resolved=False, pnl=2.0, sell_pnl=-1.0, merge_pnl=3.0),
+    ]
+    curve = [10_000.0, 10_040.0]
+    assert pnl_stats(records, curve, 10_000.0).pnl_unrealised == pytest.approx(33.0)  # 40 - 7
+    explicit = pnl_stats(records, curve, 10_000.0, final_equity=10_020.0)
+    assert explicit.pnl_unrealised == pytest.approx(13.0)  # 20 - 7; the argument wins
+    # all resolved: nothing is open, so the realised rows already are the whole gain
+    done = pnl_stats([rec(n_fills=1, pnl=5.0, merge_pnl=5.0)], [10_000.0, 10_005.0], 10_000.0)
+    assert done.pnl_unrealised == pytest.approx(0.0, abs=1e-9)
+
+
 def test_pnl_stats_without_resolved_markets_or_curve() -> None:
     s = pnl_stats([], [], 10_000.0)
+    assert (s.n_markets_resolved, s.n_markets_resolved_traded, s.pnl_unrealised) == (0, 0, 0.0)
     assert (s.mean_market_pnl, s.std_market_pnl, s.sharpe_like) == (0.0, 0.0, 0.0)
     assert (s.best_market_pnl, s.worst_market_pnl, s.win_rate_traded) == (0.0, 0.0, None)
     assert (s.peak_equity, s.max_drawdown_usd, s.max_drawdown_frac) == (10_000.0, 0.0, 0.0)

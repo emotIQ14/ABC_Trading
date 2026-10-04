@@ -28,14 +28,18 @@ exchange's result, so everything else in the same snapshot sees the pre-merge in
 
 Cash and capital accounting
     ``open_orders`` passed to ``on_snapshot`` belong to the market being processed; orders of other
-    markets are ignored. Capital is cost basis plus the cash reserved by open BUY orders
-    (``price * remaining``, plus the worst-case taker fee for IOC orders, which is charged on top
-    when they execute). The engine keeps, per market, its *belief* of that reservation: refreshed
-    from ``open_orders`` at each of the market's snapshots, lowered by BUY fills (and by the fee of
-    taker fills), and set after each snapshot to (orders not cancelled) + (orders placed). For
-    market M, ``R_other`` is the sum of the beliefs of all other markets. A belief can only be too
-    high between a market's snapshots (a fill converts reservation into cost basis), which is the
-    safe direction; it is dropped at settlement.
+    markets are ignored. Capital is cost basis plus the cash reserved by open BUY orders. A BUY
+    reserves ``price * remaining`` plus the fee it will pay, which is what the exchange commits for
+    it and what its cost basis will be once filled: the worst-case taker fee for an IOC order
+    (charged on top when it executes) and a positive maker fee for a resting POST_ONLY order (a
+    maker rebate is never counted as a credit). The engine keeps, per market, its *belief* of that
+    reservation: refreshed from ``open_orders`` at each of the market's snapshots, lowered by BUY
+    fills (notional plus the positive fee of the fill, taker or maker), and set after each snapshot
+    to (orders not cancelled) + (orders placed). For market M, ``R_other`` is the sum of the
+    beliefs of all other markets. A belief can only be too high between a market's snapshots (a
+    fill converts reservation into cost basis), which is the safe direction; it is dropped at
+    settlement. A belief that left out the maker fee would be too LOW, and the next market would
+    size its ladder past the cash the exchange still has free (``insufficient_cash`` rejections).
 
     The quote budget is NOT ``portfolio.available_cash(open_orders)``: M's own resting quotes are
     re-planned as a whole each snapshot (kept orders hold at most the cash of the desired order they
@@ -51,8 +55,10 @@ Cash and capital accounting
     which bounds the total reservation of M's desired ladder. The taker completion is sized
     against the stricter ``cash - R_other - R_own`` (it runs before stale quotes are cancelled).
     Kept orders have price <= and remaining <= those of the desired order they match, so the
-    budget carries over to the reconciled book. With a real exchange this gave zero rejections and
-    never exceeded either capital cap at any latency in a randomised end-to-end sweep.
+    budget carries over to the reconciled book. With a real exchange this gives zero rejections and
+    never exceeds either capital cap at any latency in randomised end-to-end sweeps, including
+    cash-limited two-market runs with a maker fee (``tests/test_engine_cash_reservation.py``,
+    ``tests/test_backtest_e2e.py``).
 
 Reconcile (2.8)
     An existing resting order is kept iff it matches a desired level: same token, BUY, price within
@@ -63,8 +69,15 @@ Reconcile (2.8)
     first, then missing levels are placed. A requote throttle of ``min_requote_interval_seconds``
     per market suppresses discretionary changes; cancels of orders that are no longer allowed at
     all (price above the current ceiling, or the token not quotable) bypass it. Placements are
-    limited by the rate limiter, level-major (every token's level 0 before any level 1); cancels
-    are never limited but count toward the limit.
+    limited by the rate limiter, in the priority of the quoter's cash budget: a token that
+    completes pairs first, then level-major (every token's level 0 before any level 1; the level
+    is the index in the whole desired ladder); cancels are never limited but count toward the
+    limit. A cancel is not instant at the exchange: it lands
+    ``latency_ticks`` snapshots after it is sent (DESIGN 5), so an order cancelled here can still be
+    filled for that long and ``open_orders`` no longer reports it. The inventory and capital caps
+    bound what the engine *rests*, not what such a stale order adds before its cancel lands. The
+    exchange frees the cash of an order being cancelled for the orders sent behind the cancel,
+    which is why the budget above may treat a replaced ladder as released.
 
 Stats (``stats``) are monotone integer counters: ``snapshots``, ``snapshots_ignored``,
 ``quotes_placed`` / ``quotes_cancelled`` (orders emitted, not exchange acknowledgements),
@@ -89,7 +102,13 @@ from abc_trading.inventory import MarketInventory, PnLBreakdown, Portfolio
 from abc_trading.model.fair_value import FairValue, FairValueModel
 from abc_trading.strategy.directional import directional_target
 from abc_trading.strategy.phases import phase_for
-from abc_trading.strategy.quoter import QuoteLevel, TokenPlan, compute_quotes, plan_tokens
+from abc_trading.strategy.quoter import (
+    QuoteLevel,
+    TokenPlan,
+    compute_quotes,
+    is_completing,
+    plan_tokens,
+)
 from abc_trading.strategy.rebalance import pairs_to_merge, plan_completion, plan_flatten
 from abc_trading.strategy.risk import RiskManager
 from abc_trading.types import (
@@ -148,6 +167,7 @@ class _Reconciled:
     cancels: list[OpenOrder]
     places: list[QuoteLevel]
     suppressed: bool  # True iff the requote throttle held back a discretionary change
+    depths: list[int] = field(default_factory=list)  # ladder level of each of ``places``
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,8 +175,9 @@ class _Ledger:
     """Cash and capital position seen by one market at the start of its snapshot (USDC).
 
     ``reserved_own`` is the capital tied up by this market's open BUY orders (as passed in, with
-    the worst-case taker fee on IOC orders), ``pinned`` the part of it held by IOC orders (they are
-    never re-planned, so their reservation cannot be reused by the new ladder), and
+    the fee each will pay: worst-case taker fee on IOC orders, positive maker fee on resting
+    bids), ``pinned`` the part of it held by IOC orders (they are never re-planned, so their
+    reservation cannot be reused by the new ladder), and
     ``reserved_other`` the engine's belief of the same quantity in all other markets. See the
     module docstring for why the two budgets below differ.
     """
@@ -239,8 +260,9 @@ class MarketMakerEngine:
         self._bump("fills")
         st = self._states.get(fill.market_id)
         if st is not None and fill.side is Side.BUY:
-            # A taker fill also releases the worst-case fee that was set aside for its IOC order.
-            released = fill.price * fill.size + (0.0 if fill.is_maker else max(fill.fee, 0.0))
+            # The fee set aside for the order (taker fee of an IOC, positive maker fee of a resting
+            # bid) leaves the belief together with the notional; a rebate was never reserved.
+            released = fill.price * fill.size + max(fill.fee, 0.0)
             st.reserved = max(0.0, st.reserved - released)
 
     def on_merge(self, result: MergeResult) -> None:
@@ -442,7 +464,7 @@ class MarketMakerEngine:
         if rec.suppressed:
             self._bump("requotes_throttled")
         cancel_actions = self._emit_cancels(rec.cancels, ts)
-        places = self._place_quotes(inv.market_id, rec, ts)
+        places = self._place_quotes(inv, rec, ts)
         if cancel_actions or places:
             st.last_requote_ts = ts
         return cancel_actions, takers, places
@@ -497,7 +519,11 @@ class MarketMakerEngine:
         tol = self.cfg.sizing.requote_tolerance_ticks * snap.market.tick_size
         unmatched = list(resting)
         missing: list[QuoteLevel] = []
+        depths: list[int] = []
+        ladder_depth: dict[Outcome, int] = {}
         for q in desired:
+            depth = ladder_depth.get(q.token, 0)  # this level's index in its token's ladder
+            ladder_depth[q.token] = depth + 1
             best: OpenOrder | None = None
             best_key: tuple[float, float, str] | None = None
             for o in unmatched:
@@ -512,6 +538,7 @@ class MarketMakerEngine:
                     best, best_key = o, key
             if best is None:
                 missing.append(q)
+                depths.append(depth)
             else:
                 unmatched.remove(best)
 
@@ -519,7 +546,7 @@ class MarketMakerEngine:
         interval = self.cfg.timing.min_requote_interval_seconds
         throttled = st.last_requote_ts is not None and ts - st.last_requote_ts + EPS < interval
         if not throttled:
-            return _Reconciled(unmatched, missing, False)
+            return _Reconciled(unmatched, missing, False, depths)
         urgent = [o for o in unmatched if self._is_disallowed(o, plans, skip)]
         suppressed = bool(missing) or len(urgent) < len(unmatched)
         return _Reconciled(urgent, [], suppressed)
@@ -534,25 +561,30 @@ class MarketMakerEngine:
         ceiling = plans[o.token].ceiling
         return ceiling is None or o.price > ceiling + EPS
 
-    def _place_quotes(self, market_id: str, rec: _Reconciled, ts: float) -> list[PlaceOrder]:
-        """Rate-limit the missing levels (level-major priority) and build their orders."""
+    def _place_quotes(self, inv: MarketInventory, rec: _Reconciled, ts: float) -> list[PlaceOrder]:
+        """Rate-limit the missing levels and build their orders.
+
+        When the limiter grants fewer placements than are missing, the priority is the quoter's
+        (``compute_quotes``): the token that completes pairs first, then ladder depth (every
+        token's level 0 before any level 1), then UP before DOWN on an exact tie. The depth is the
+        level's index in the whole desired ladder, not among the still-missing levels, so a token
+        whose level 0 already rests does not outrank the other token's level 0.
+        """
         if not rec.places:
             return []
-        rank: dict[Outcome, int] = {}
-        keyed: list[tuple[int, int, int]] = []  # (level rank, token order, index)
-        for i, q in enumerate(rec.places):
-            level = rank.get(q.token, 0)
-            rank[q.token] = level + 1
-            keyed.append((level, 0 if q.token is Outcome.UP else 1, i))
+        keyed = sorted(
+            (0 if is_completing(inv, q.token) else 1, depth, 0 if q.token is Outcome.UP else 1, i)
+            for i, (q, depth) in enumerate(zip(rec.places, rec.depths, strict=True))
+        )
         granted = self.risk.allow_orders(ts, len(rec.places))
-        allowed = {i for _, _, i in sorted(keyed)[:granted]}
+        allowed = {key[-1] for key in keyed[:granted]}
         dropped = len(rec.places) - granted
         if dropped:
             self._bump("orders_rate_limited", dropped)
         out: list[PlaceOrder] = []
         for i, q in enumerate(rec.places):
             if i in allowed:
-                out.append(self._order(market_id, q.token, Side.BUY, q.price, q.size, False))
+                out.append(self._order(inv.market_id, q.token, Side.BUY, q.price, q.size, False))
                 self._bump("quotes_placed")
         return out
 
@@ -577,12 +609,19 @@ class MarketMakerEngine:
         self.stats[key] = self.stats.get(key, 0) + n
 
     def _reserved_capital(self, orders: Sequence[OpenOrder]) -> float:
-        """Capital tied up by BUY orders: ``price * remaining`` (what the exchange reserves) plus
-        the worst-case taker fee of IOC orders, which is charged on top when they execute."""
+        """Capital tied up by BUY orders: ``price * remaining`` plus the fee the order will pay.
+
+        That is the worst-case taker fee for an IOC order (charged on top when it executes) and
+        any positive maker fee for a resting POST_ONLY order, which is exactly what the exchange
+        commits for it (``PaperExchange._commitment``) and what its cost basis will be once it
+        fills (DESIGN 2.1: buys are all-in). A maker rebate (negative fee) is never counted as a
+        credit, so the belief cannot fall below what the exchange holds back.
+        """
         total = self.portfolio.reserved_cash(orders)  # also validates prices and sizes
         for o in orders:
-            if o.side is Side.BUY and o.tif is TimeInForce.IOC:
-                total += max(0.0, self.fees.fee(o.price, max(o.remaining, 0.0), False))
+            if o.side is Side.BUY:
+                is_maker = o.tif is not TimeInForce.IOC
+                total += max(0.0, self.fees.fee(o.price, max(o.remaining, 0.0), is_maker))
         return total
 
     @staticmethod

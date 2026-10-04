@@ -1,8 +1,10 @@
-"""Paper exchange: deterministic, conservative matching of our orders against public data.
+"""Paper exchange: deterministic matching of our orders against public data.
 
 There is NO live trading here: no signing, keys, wallets or network. The exchange only replays
 market data (books and public prints) handed to ``process`` and decides which of *our* orders
-would have filled. Results validate mechanics, not profitability.
+would have filled. Results validate mechanics, not profitability. The fill model is pessimistic
+about queue position and latency but has never been compared with a real venue (see "What the
+model still gets optimistically" below).
 
 Units: prices are USDC per share in (0, 1) for orders; sizes are shares; cash is USDC; ``ts`` is
 unix seconds. Comparisons use ``EPS`` (1e-9) tolerance.
@@ -11,14 +13,25 @@ Order lifecycle (DESIGN section 5)
 ----------------------------------
 ``submit`` validates, then the order is *in flight* (``OpenOrder.live=False``) for
 ``latency_ticks`` snapshots **of its market** and then *live*. With ``latency_ticks == 0`` it is
-live at submit time. ``process(snap)`` does, in this order: (1) match already-live resting
-orders against ``snap.trades``; (2) activate in-flight orders whose delay elapsed (POST_ONLY is
-re-checked against ``snap``'s book, crossing means cancel + ``post_only_cancels``; the queue
-position is set; IOC executes against ``snap``); (3) remember ``snap``'s books as the last known
-books. Hence an order never fills from a print that predates the moment it became live.
+live at submit time. ``cancel`` is a message to the venue like an order and takes the same time:
+with ``latency_ticks > 0`` a cancel sent after the market's snapshot ``n`` lands once snapshot
+``n + latency_ticks`` has been processed. Until then the order is still open at the venue: it stays
+matchable against prints and can fill, but it is hidden from ``open_orders`` (the caller already
+asked for it to go; ``pending_cancels`` lists such orders) and no longer reserves funds, see
+"Cancels and funds". A cancel can never overtake the order it targets (the order was sent first),
+so an in-flight order still activates before its cancel lands, and an IOC in flight executes at
+activation whatever was sent after it. A cancel that finds its order already gone (fully filled,
+executed, or cancelled by the post-only re-check) does nothing and counts as ``cancel_too_late``.
+``process(snap)`` does, in this order: (1) match already-live resting orders against
+``snap.trades``; (2) activate in-flight orders whose delay elapsed (POST_ONLY is re-checked against
+``snap``'s book, crossing means cancel + ``post_only_cancels``; the queue position is set; IOC
+executes against ``snap``); (3) land the cancels that are due, i.e. remove their orders (so the
+prints of the landing snapshot can still fill a cancelled order, those of later snapshots cannot);
+(4) remember ``snap``'s books as the last known books. Hence an order never fills from a print that
+predates the moment it became live, and never after the cancel that removes it has landed.
 
-Fill model (all conservative)
------------------------------
+Fill model (pessimistic about queues and latency)
+-------------------------------------------------
 * A resting order's fill price is ALWAYS its own limit price (maker). A resting BUY at ``p`` vs a
   SELL-aggressor print on the same token at ``tp``: ``tp < p`` is a through-fill (fills
   ``min(remaining, avail)``); ``tp == p`` first drains ``queue_ahead`` and the remainder fills us;
@@ -34,8 +47,19 @@ Fill model (all conservative)
 * IOC fills walk the book levels within the limit, best first. The fill price is the level price
   moved ``taker_slippage_ticks`` ticks against us but never beyond the limit. Depth consumed by
   one IOC is not available to the next one against the same snapshot (shared per-snapshot
-  consumption). Taker fees come from ``FeeModel``; maker fees/rebates from the same model.
+  consumption), and the two books are one liquidity pool (DESIGN 1: an UP ask at ``a`` is the
+  DOWN bid at ``1 - a``, an UP bid at ``b`` the DOWN ask at ``1 - b``), so depth is consumed per
+  UP-book coordinate: a BUY of UP at ask ``a`` and a SELL of DOWN at bid ``1 - a`` draw on the
+  same shares. The size available to an order is the size its own book displays at that level
+  minus what the pool has already lost to earlier IOCs this snapshot. Taker fees come from
+  ``FeeModel``; maker fees/rebates from the same model.
 * Fills are timestamped with the snapshot ``ts`` (or the submit ``ts`` for submit-time IOC).
+
+What the model still gets optimistically: it assumes the displayed books and prints are complete
+and timely, ignores our own market impact, merges instantly and for free, never has an order
+rejected by the venue, and lets a cancel fail only by losing a race to a fill (there are no cancel
+rejections or reorderings). Queue position, latency and the fill fractions are assumptions, not
+measurements.
 
 Cash and positions
 ------------------
@@ -50,16 +74,33 @@ Cash and positions
 * ``cash >= 0`` and ``cash >= reserved_cash`` and ``position >= reserved sells`` are asserted
   after every mutating call (``AssertionError`` = bug in this module).
 
+Cancels and funds
+-----------------
+* A cancel reaches the venue before anything submitted after it (same latency, same order of
+  arrival). A BUY or SELL sent behind a cancel is therefore checked against funds that already
+  exclude the order being cancelled: its cash or shares are free for later orders, IOC budgets and
+  merges at once, although the order itself can still fill until the cancel lands.
+  ``reserved_cash``, ``open_orders`` and the self-check leave such orders out.
+* To keep the funds invariants true, a fill of an order with a pending cancel is capped to what
+  the cash (BUY) or shares (SELL) not reserved by the other open orders can pay for. The
+  replacement therefore wins over the stale order. This only matters when the account is cash- or
+  position-limited, and then it is optimistic: a real venue would fill the stale order first and
+  reject the replacement. With ample cash it never binds.
+
 Additions beyond DESIGN 4.4
 ---------------------------
 * ``drain_fills()``: with ``latency_ticks == 0`` an IOC executes inside ``submit`` and the
   protocol has no way to return its fills, so they are queued and returned by the next
   ``process`` (first in the list). ``drain_fills()`` hands them over earlier. ``settle`` raises
   ``ValueError`` if the market still has undelivered fills.
+* ``pending_cancels(market_id=None)``: copies of the orders whose cancel was accepted but has not
+  landed (hidden from ``open_orders``, not counted in ``reserved_cash``), sorted by order id.
 * Market parameters (tick, min size) come from the market's last snapshot; before the first
   snapshot they fall back to ``cfg.sim.tick_size`` / ``cfg.sim.min_order_size``.
 * ``stats`` is ``dict[str, float]`` (volumes are USDC notionals, counters stay ints) with extra
-  keys ``accepted`` and ``cancelled``; ``submitted`` counts every ``submit`` call.
+  keys ``accepted``, ``cancelled`` (orders removed by a cancel that landed) and
+  ``cancel_too_late`` (cancels that found their order already gone); ``submitted`` counts every
+  ``submit`` call. Cancels still pending when a market settles are in neither counter.
 * ``process`` raises ``ValueError`` for malformed data, an out-of-order snapshot timestamp (equal
   is allowed) or a snapshot of a settled market, before changing any state.
 
@@ -114,6 +155,7 @@ REJECT_CASH = "insufficient_cash"
 REJECT_POSITION = "insufficient_position"
 
 _Key = tuple[str, Outcome]  # (market_id, token)
+_Pool = tuple[bool, float]  # (takes the UP ask side?, UP-book price): one pool of IOC liquidity
 
 
 @dataclass(slots=True)
@@ -170,6 +212,18 @@ def _best(levels: Iterable[Level], *, lowest: bool) -> float | None:
     if not prices:
         return None
     return min(prices) if lowest else max(prices)
+
+
+def _pool(token: Outcome, taker_side: Side, level_price: float) -> _Pool:
+    """UP-book coordinates of the liquidity an IOC takes at ``level_price`` of ``token``'s book.
+
+    The books mirror one pool (DESIGN 1): a BUY of UP takes the UP ask at ``a``, and so does a
+    SELL of DOWN at the DOWN bid ``1 - a``; a SELL of UP takes the UP bid ``b``, and so does a
+    BUY of DOWN at the DOWN ask ``1 - b``. Depth taken through one of them is gone for the other.
+    """
+    takes_ask = (taker_side is Side.BUY) == (token is Outcome.UP)
+    up_price = level_price if token is Outcome.UP else 1.0 - level_price
+    return takes_ask, round(up_price, 9)
 
 
 def _crosses(side: Side, price: float, book: BookSnapshot) -> bool:
@@ -251,8 +305,10 @@ class PaperExchange:
         self._snap_count: dict[str, int] = {}  # snapshots processed per market (latency clock)
         self._last_ts: dict[str, float] = {}
         self._views: dict[str, _MarketView] = {}
-        # depth already taken from the last known books: market -> (token, taker side, level price)
-        self._consumed: dict[str, dict[tuple[Outcome, Side, float], float]] = {}
+        # depth already taken from the last known books: market -> UP-book pool coordinate -> shares
+        self._consumed: dict[str, dict[_Pool, float]] = {}
+        # accepted cancels not yet landed: order id -> (market id, snapshot count it lands at)
+        self._cancels: dict[str, tuple[str, int]] = {}
         self._settled: set[str] = set()
         self._pending: list[Fill] = []  # fills made at submit time, not yet handed out
         self._next_order = 1
@@ -261,6 +317,7 @@ class PaperExchange:
             "submitted": 0,
             "accepted": 0,
             "cancelled": 0,
+            "cancel_too_late": 0,
             "filled_maker": 0,
             "filled_taker": 0,
             "post_only_cancels": 0,
@@ -283,22 +340,40 @@ class PaperExchange:
 
     @property
     def reserved_cash(self) -> float:
-        """Cash reserved by open BUY orders: ``sum(price * remaining)``, in flight or live."""
+        """Cash reserved by open BUY orders: ``sum(price * remaining)``, in flight or live.
+
+        Orders whose cancel is pending are not counted (they are not in ``open_orders`` either):
+        everything submitted after the cancel reaches the venue behind it, so their cash is
+        already free for it (module docstring, "Cancels and funds").
+        """
         return sum(
             (
                 st.order.price * st.order.remaining
-                for st in self._orders.values()
-                if st.order.side is Side.BUY
+                for oid, st in self._orders.items()
+                if st.order.side is Side.BUY and oid not in self._cancels
             ),
             0.0,
         )
 
     def open_orders(self, market_id: str | None = None) -> list[OpenOrder]:
-        """Copies of the open orders sorted by numeric order id."""
+        """Copies of the open orders sorted by numeric order id.
+
+        Orders whose cancel was accepted but has not landed yet are left out (see
+        ``pending_cancels``): the caller already asked for them to go. They are still open at the
+        venue and can still fill, but they no longer reserve funds (``reserved_cash``).
+        """
+        return self._copies(market_id, pending=False)
+
+    def pending_cancels(self, market_id: str | None = None) -> list[OpenOrder]:
+        """Copies of the orders whose cancel has been accepted but has not landed, by order id."""
+        return self._copies(market_id, pending=True)
+
+    def _copies(self, market_id: str | None, *, pending: bool) -> list[OpenOrder]:
         sts = [
             st
-            for st in self._orders.values()
-            if market_id is None or st.order.market_id == market_id
+            for oid, st in self._orders.items()
+            if (oid in self._cancels) is pending
+            and (market_id is None or st.order.market_id == market_id)
         ]
         sts.sort(key=lambda st: st.seq)
         return [replace(st.order) for st in sts]
@@ -322,11 +397,26 @@ class PaperExchange:
         return self._accept(req, ts)
 
     def cancel(self, order_id: str, ts: float) -> bool:
-        """Cancel an open (live or in-flight) order; ``False`` if unknown or already done."""
+        """Ask the venue to cancel an open (live or in-flight) order.
+
+        Returns ``True`` iff the request was accepted: the order exists and no cancel for it is
+        pending already. With ``latency_ticks == 0`` the order is gone at once. Otherwise the
+        cancel takes ``latency_ticks`` snapshots of the order's market to land (module docstring):
+        until then the order can still fill, ``open_orders`` no longer reports it and its funds
+        are free for later orders. ``False`` if the order is unknown, already gone or already
+        pending.
+        """
         _require(_finite(ts), f"ts must be finite, got {ts!r}")
-        if self._orders.pop(order_id, None) is None:
+        st = self._orders.get(order_id)
+        if st is None or order_id in self._cancels:
             return False
-        self.stats["cancelled"] += 1
+        latency = self._xcfg.latency_ticks
+        if latency == 0:
+            del self._orders[order_id]
+            self.stats["cancelled"] += 1
+        else:
+            mid = st.order.market_id
+            self._cancels[order_id] = (mid, self._snap_count.get(mid, 0) + latency)
         self._check_invariants()
         return True
 
@@ -366,6 +456,8 @@ class PaperExchange:
         )
         for oid in [oid for oid, st in self._orders.items() if st.order.market_id == market_id]:
             del self._orders[oid]
+        for oid in [oid for oid, (mid, _) in self._cancels.items() if mid == market_id]:
+            del self._cancels[oid]
         payout = self.position(market_id, winner)  # $1 per winning share
         for token in Outcome:
             self._positions.pop((market_id, token), None)
@@ -389,6 +481,7 @@ class PaperExchange:
         self._consumed[mid] = {}  # fresh books, fresh depth
         fills.extend(self._match_prints(snap))
         fills.extend(self._activate(snap))
+        self._land_cancels(mid)
         self._views[mid] = _MarketView(spec=snap.market, up=snap.up_book, down=snap.down_book)
         self._check_invariants()
         return fills
@@ -462,9 +555,20 @@ class PaperExchange:
             st.queue_ahead -= drained
             avail -= drained
         qty = min(o.remaining, avail)
+        if o.order_id in self._cancels:  # funds were released to the orders sent behind the cancel
+            qty = min(qty, self._pending_room(o))
         if qty <= EPS:
             return avail, None
         return avail - qty, self._book_fill(o, o.price, qty, is_maker=True, ts=ts)
+
+    def _pending_room(self, o: OpenOrder) -> float:
+        """Shares an order with a pending cancel may still trade without eating into the cash (BUY)
+        or shares (SELL) that the orders which are not being cancelled have reserved."""
+        if o.side is Side.SELL:
+            return max(0.0, self._free_position(o.market_id, o.token, skip=o.order_id))
+        free = self._cash - self._committed(skip=o.order_id)
+        unit = o.price + max(0.0, self._fees.fee(o.price, 1.0, True))
+        return max(0.0, free) / unit
 
     def _activate(self, snap: MarketSnapshot) -> list[Fill]:
         """Step 2: in-flight orders whose delay elapsed go live (POST_ONLY) or execute (IOC)."""
@@ -491,6 +595,17 @@ class PaperExchange:
                 st.live_ts = snap.ts
                 st.queue_ahead = self._queue_ahead(o, book)
         return fills
+
+    def _land_cancels(self, market_id: str) -> None:
+        """Step 3: cancels whose delay elapsed reach the venue; this snapshot's prints are done."""
+        count = self._snap_count[market_id]
+        due = [oid for oid, (mid, at) in self._cancels.items() if mid == market_id and at <= count]
+        for oid in due:
+            del self._cancels[oid]
+            if self._orders.pop(oid, None) is None:  # filled, executed or post-only-cancelled
+                self.stats["cancel_too_late"] += 1
+            else:
+                self.stats["cancelled"] += 1
 
     # ------------------------------------------------------------------ submit internals
 
@@ -585,7 +700,7 @@ class PaperExchange:
 
         BUY is limited by affordable cash (cash minus what the other open BUYs commit), SELL by
         the shares not reserved by other open SELLs. Depth taken here stays taken for the rest
-        of this snapshot.
+        of this snapshot, through the mirrored book as well (``_pool``).
         """
         o = st.order
         is_buy = o.side is Side.BUY
@@ -610,7 +725,7 @@ class PaperExchange:
                     break
                 price = max(level_price - slip, o.price)
             price = round(price, 9)
-            key = (o.token, o.side, level_price)
+            key = _pool(o.token, o.side, level_price)
             qty = min(o.remaining, level_size - consumed.get(key, 0.0))
             if qty <= EPS:  # level used up by earlier IOCs on this snapshot
                 continue
@@ -687,17 +802,25 @@ class PaperExchange:
         return total
 
     def _committed(self, skip: str | None = None) -> float:
+        """Cash claimed by the open BUYs other than ``skip`` and those with a pending cancel."""
         return sum(
-            (self._commitment(st.order) for oid, st in self._orders.items() if oid != skip), 0.0
+            (
+                self._commitment(st.order)
+                for oid, st in self._orders.items()
+                if oid != skip and oid not in self._cancels
+            ),
+            0.0,
         )
 
     def _free_position(self, market_id: str, token: Outcome, skip: str | None = None) -> float:
-        """Shares held minus the remaining size of open SELLs (other than ``skip``)."""
+        """Shares held minus the remaining size of open SELLs (other than ``skip`` and those with
+        a pending cancel)."""
         reserved = sum(
             (
                 st.order.remaining
                 for oid, st in self._orders.items()
                 if oid != skip
+                and oid not in self._cancels
                 and st.order.side is Side.SELL
                 and st.order.market_id == market_id
                 and st.order.token is token
@@ -723,6 +846,8 @@ class PaperExchange:
                 raise AssertionError(
                     f"PaperExchange invariant broken: open order {o.order_id} has no remaining size"
                 )
+            if o.order_id in self._cancels:  # released: see "Cancels and funds"
+                continue
             if o.side is Side.BUY:
                 reserved += o.price * o.remaining
                 committed += self._commitment(o)
@@ -740,6 +865,12 @@ class PaperExchange:
         for key, qty in self._positions.items():
             if qty < 0.0:
                 raise AssertionError(f"PaperExchange invariant broken: negative position {key!r}")
+        for oid, (mid, at) in self._cancels.items():
+            if at <= self._snap_count.get(mid, 0):
+                raise AssertionError(
+                    f"PaperExchange invariant broken: cancel of {oid} was due at snapshot {at} "
+                    f"of {mid!r} but is still pending"
+                )
         for key, held in sells.items():
             if held > self._positions.get(key, 0.0) + _ASSERT_TOL:
                 raise AssertionError(

@@ -299,6 +299,85 @@ def test_randomised_configs_never_violate_an_invariant() -> None:
         assert_accounting_consistent(r)
 
 
+def two_asset_cfg(cash: float, maker_fee: float, **sim: object) -> BotConfig:
+    """BTC + ETH side by side with an account small enough that cash limits the ladders."""
+    cfg = small_cfg(assets=("BTC", "ETH"), n_windows=1, **sim)
+    return replace(
+        cfg,
+        exchange=replace(cfg.exchange, initial_cash=cash),
+        fees=replace(cfg.fees, maker_fee_rate=maker_fee),
+    )
+
+
+@pytest.mark.parametrize("maker_fee", [0.0, 0.001, 0.02])
+@pytest.mark.parametrize("cash", [100.0, 300.0, 500.0])
+def test_cash_limited_two_market_runs_are_never_refused_for_cash(
+    cash: float, maker_fee: float
+) -> None:
+    """The engine's belief of what the other market has reserved must equal what the exchange
+    commits (price * remaining plus any positive maker fee), at every account size. Before the
+    fix a positive maker fee with binding cash made the exchange refuse thousands of orders
+    with ``insufficient_cash``."""
+    r = run(two_asset_cfg(cash, maker_fee, seed=1))
+    assert r.runner_stats["order_rejections"] == {}
+    assert r.activity.n_fills > 0  # it traded within its means
+    assert_accounting_consistent(r)
+
+
+@pytest.mark.parametrize("latency", [1, 2, 3])
+@pytest.mark.parametrize("maker_fee", [0.0, 0.001])
+@pytest.mark.parametrize("cash", [100.0, 300.0])
+def test_cash_limited_runs_with_slow_cancels_are_never_refused_for_cash(
+    cash: float, maker_fee: float, latency: int
+) -> None:
+    """A cancel takes ``latency_ticks`` to land (DESIGN 5), so the quotes the engine replaces every
+    snapshot are still at the venue for that long. The exchange frees their cash for the orders sent
+    behind the cancel, so the engine's budget (which treats a replaced ladder as released) still
+    never gets an order refused for cash, even when a cancelled quote is hidden for several
+    snapshots."""
+    cfg = two_asset_cfg(cash, maker_fee, seed=2)
+    cfg = replace(cfg, exchange=replace(cfg.exchange, latency_ticks=latency))
+    r = run(cfg)
+    assert r.runner_stats["order_rejections"] == {}
+    assert r.runner_stats["cancel_misses"] == 0
+    assert r.exchange_stats["cancelled"] > 0 and r.activity.n_fills > 0
+    assert_accounting_consistent(r)
+
+
+def test_randomised_cash_limited_configs_are_never_refused_for_cash() -> None:
+    rng = random.Random(20260511)
+    for case in range(10):
+        cfg = two_asset_cfg(
+            rng.choice([60.0, 100.0, 200.0, 300.0, 500.0, 700.0]),
+            rng.choice([0.0, 0.001, 0.005, 0.02]),
+            seed=rng.randint(1, 10_000),
+            informed_flow=rng.choice([0.0, 0.5, 1.0]),
+            market_lag_seconds=rng.choice([0.0, 2.0, 5.0]),
+        )
+        cfg = replace(
+            cfg,
+            exchange=replace(
+                cfg.exchange,
+                latency_ticks=rng.randint(0, 2),
+                queue_ahead_fraction=rng.choice([0.0, 1.0]),
+                taker_slippage_ticks=rng.randint(0, 1),
+            ),
+            fees=replace(
+                cfg.fees,
+                maker_rebate_rate=rng.choice([0.0, 0.001]),
+                taker_fee_rate=rng.choice([0.05, 0.25]),
+            ),
+            sizing=replace(
+                cfg.sizing,
+                clip_shares=rng.choice([20.0, 100.0, 300.0]),
+                ladder_levels=rng.choice([1, 3, 5]),
+            ),
+        )
+        r = run(cfg)
+        assert r.runner_stats["order_rejections"] == {}, (case, cfg.exchange.initial_cash)
+        assert_accounting_consistent(r)
+
+
 def test_kill_switch_is_reported_and_the_run_still_ends_clean(
     base: tuple[BotConfig, BacktestResult],
 ) -> None:

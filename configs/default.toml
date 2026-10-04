@@ -7,6 +7,9 @@
 #
 # `sizing.clip_equity_fraction` defaults to None, which TOML cannot represent, so the key is
 # omitted below. Set it to a number in (0, 1] to size clips as equity * fraction / price.
+#
+# Values must have the type shown here (true, not "false"; 3, not 3.0, for an integer key):
+# a wrong type is a configuration error (exit status 2) that names the key.
 
 [fees]
 # taker fee = size * price * taker_fee_rate * (price * (1 - price)) ** taker_fee_exponent
@@ -23,7 +26,7 @@ max_clip_shares = 1000.0    # upper bound when sizing from equity
 ladder_levels = 3           # resting bids per token
 ladder_spacing_ticks = 1    # ticks between ladder levels
 ladder_size_decay = 0.7     # size multiplier per deeper ladder level
-requote_tolerance_ticks = 0 # keep a resting order if its price is within this many ticks
+requote_tolerance_ticks = 0 # keep a resting bid at most this many ticks BELOW desired (never above)
 
 [pair]
 target_margin = 0.01        # want avg_up_cost + avg_down_cost <= 1 - target_margin
@@ -72,10 +75,11 @@ max_spread_ticks_to_quote = 6       # do not quote dislocated/wide books
 [exchange]
 # paper exchange only: there is no live trading in this project
 initial_cash = 10000.0      # starting USDC
-latency_ticks = 1           # snapshots before a new order can fill
+latency_ticks = 1           # snapshots before a new order can fill or a cancel takes effect
 queue_ahead_fraction = 1.0  # share of displayed size at our price assumed ahead of us
 trade_fill_fraction = 1.0   # share of a print assumed available to us after the queue
-taker_slippage_ticks = 0    # extra adverse ticks charged on IOC fills
+taker_slippage_ticks = 0    # ticks an IOC fill moves against us, never beyond its limit
+                            # (the engine's IOC limit is the touch: no effect at latency 0)
 enforce_min_order_size = true       # reject orders below the market's minimum size
 
 [sim]

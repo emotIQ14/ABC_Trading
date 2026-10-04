@@ -557,6 +557,51 @@ def test_book_imbalance_weight_moves_z_by_exactly_w_times_obi() -> None:
     assert weighted.z_adj - base.z_adj == pytest.approx(0.4 * -0.5, abs=1e-12)
 
 
+def test_book_imbalance_subtracts_the_down_book_imbalance_hand_computed() -> None:
+    # DESIGN 3: obi = up_book.imbalance - down_book.imbalance. Every case below has a DOWN book that
+    # is NOT balanced; with w_book_imbalance = 0.5 the pure z of the HAND state is 1/sqrt 2.
+    #   UP balanced 20/20 (0), DOWN bids 40 vs asks 10 -> (40 - 10) / 50 = +0.6: obi = -0.6
+    #     z_adj = 0.7071067811865475 - 0.3 = 0.4071067811865475, Phi = 0.6580352184582468
+    #   UP balanced, DOWN bids 10 vs asks 40 -> -0.6: obi = +0.6
+    #     z_adj = 0.7071067811865475 + 0.3 = 1.0071067811865475, Phi = 0.8430582685849141
+    #   UP 30/10 (+0.5) and DOWN 40/10 (+0.6): obi = 0.5 - 0.6 = -0.1 (the UP book alone would say
+    #     +0.5, the sum +1.1)
+    #     z_adj = 0.7071067811865475 - 0.05 = 0.6571067811865474, Phi = 0.7444438705339625
+    cfg = cfg_with(w_book_imbalance=0.5)
+    for bk, obi, z_adj, p in [
+        (books(20.0, 20.0, 40.0, 10.0), -0.6, 0.4071067811865475, 0.6580352184582468),
+        (books(20.0, 20.0, 10.0, 40.0), 0.6, 1.0071067811865475, 0.8430582685849141),
+        (books(30.0, 10.0, 40.0, 10.0), -0.1, 0.6571067811865474, 0.7444438705339625),
+    ]:
+        fv = hand_model(cfg).estimate(hand_snap(bk=bk))
+        assert fv.book_imbalance == pytest.approx(obi, abs=1e-15)
+        assert fv.z == pytest.approx(0.7071067811865475, abs=1e-12)
+        assert fv.z_adj == pytest.approx(z_adj, abs=1e-12)
+        assert fv.p_up_model == pytest.approx(p, abs=1e-12)
+
+
+def test_down_book_imbalance_moves_obi_opposite_to_the_up_book_imbalance() -> None:
+    # +0.5 on the UP book and +0.5 on the DOWN book cancel; +0.5 on one book alone moves obi by
+    # exactly +/- 0.5 depending on which book it is
+    only_up = hand_model().estimate(hand_snap(bk=books(30.0, 10.0, 20.0, 20.0)))
+    only_down = hand_model().estimate(hand_snap(bk=books(20.0, 20.0, 30.0, 10.0)))
+    both = hand_model().estimate(hand_snap(bk=books(30.0, 10.0, 30.0, 10.0)))
+    assert only_up.book_imbalance == pytest.approx(0.5, abs=1e-15)
+    assert only_down.book_imbalance == pytest.approx(-0.5, abs=1e-15)
+    assert both.book_imbalance == pytest.approx(0.0, abs=1e-15)
+    # a bid-heavy DOWN book is the same signal as an ask-heavy UP book
+    ask_heavy_up = hand_model().estimate(hand_snap(bk=books(10.0, 30.0, 20.0, 20.0)))
+    assert ask_heavy_up.book_imbalance == pytest.approx(only_down.book_imbalance, abs=1e-15)
+
+
+def test_down_book_depth_beyond_five_levels_is_ignored_like_the_up_book() -> None:
+    bids = [(0.44 - 0.01 * i, 10.0) for i in range(5)] + [(0.30, 10_000.0)]  # 6th level ignored
+    asks = [(0.46 + 0.01 * i, 30.0) for i in range(5)]
+    up, _ = books()
+    fv = hand_model().estimate(hand_snap(bk=(up, book(DOWN, bids, asks))))
+    assert fv.book_imbalance == pytest.approx(0.5, abs=1e-15)  # 0 - (50 - 150) / 200
+
+
 # --------------------------------------------------------------------------- estimate: behaviour
 
 
@@ -663,10 +708,19 @@ def test_antisymmetry_negating_displacement_and_features_gives_complement() -> N
     b = FairValueModel(cfg)  # mirror-image tape: x -> -x, so every log-return flips sign
     for i, x in enumerate(HAND_X):
         b.observe("BTC", float(i), spot_of(-x))
-    for xs, xr in [(0.05, 0.01), (-0.03, 0.02), (0.4, 0.0), (0.0, 0.0), (0.011, -0.007)]:
-        sa = make_snap(4.0, spot_of(xs), spot_of(xr), bk=books(30.0, 10.0, 20.0, 20.0))
-        # mirrored books: UP imbalance 10 vs 30 = -0.5, DOWN unchanged -> obi = -0.5
-        sb = make_snap(4.0, spot_of(-xs), spot_of(-xr), bk=books(10.0, 30.0, 20.0, 20.0))
+    for k, (xs, xr) in enumerate(
+        [(0.05, 0.01), (-0.03, 0.02), (0.4, 0.0), (0.0, 0.0), (0.011, -0.007)]
+    ):
+        # a heavy UP bid on one tape, its mirror (a heavy UP ask) on the mirror-image tape; every
+        # other case uses the DOWN book instead, where the mirror of a heavy DOWN ask is a heavy
+        # DOWN bid and the UP book is balanced
+        books_a, books_b = (
+            (books(30.0, 10.0, 20.0, 20.0), books(10.0, 30.0, 20.0, 20.0))
+            if k % 2 == 0
+            else (books(20.0, 20.0, 10.0, 40.0), books(20.0, 20.0, 40.0, 10.0))
+        )
+        sa = make_snap(4.0, spot_of(xs), spot_of(xr), bk=books_a)
+        sb = make_snap(4.0, spot_of(-xs), spot_of(-xr), bk=books_b)
         fa, fb = a.estimate(sa), b.estimate(sb)
         assert fa.sigma == pytest.approx(fb.sigma, rel=1e-12)
         assert fb.z == pytest.approx(-fa.z, abs=1e-12)
@@ -781,6 +835,30 @@ def oracle(
     return True, sigma, z, mom, accel, p
 
 
+def independent_obi(snap: MarketSnapshot) -> float:
+    """DESIGN 3 order-book feature from the raw levels: top five levels, UP minus DOWN, in [-1, 1].
+    Written out here so that the oracle does not read the model's own ``book_imbalance``."""
+
+    def imbalance(bk: BookSnapshot) -> float:
+        bid, ask = sum(lv.size for lv in bk.bids[:5]), sum(lv.size for lv in bk.asks[:5])
+        return 0.0 if bid + ask <= 0.0 else (bid - ask) / (bid + ask)
+
+    return max(-1.0, min(1.0, imbalance(snap.up_book) - imbalance(snap.down_book)))
+
+
+def random_books(rng: random.Random) -> tuple[BookSnapshot, BookSnapshot]:
+    """Independent random ladders of 0-7 levels per side on BOTH tokens (so the top-five cut and
+    a non-zero DOWN imbalance both occur); prices are plausible but irrelevant to the feature."""
+
+    def ladder(start: float, step: float) -> list[tuple[float, float]]:
+        return [(start + step * i, rng.uniform(1.0, 100.0)) for i in range(rng.randint(0, 7))]
+
+    return (
+        book(UP, ladder(0.54, -0.01), ladder(0.56, 0.01)),
+        book(DOWN, ladder(0.44, -0.01), ladder(0.46, 0.01)),
+    )
+
+
 def test_random_series_match_independent_full_history_oracle() -> None:
     cfg = ModelConfig(shrink_to_market=0.0)  # production weights, lookbacks 30 / 10
     for seed in range(12):
@@ -796,15 +874,12 @@ def test_random_series_match_independent_full_history_oracle() -> None:
             spot = obs[-1][1] * math.exp(rng.gauss(0.0, 1e-3))
             ref = obs[-1][1] * math.exp(rng.gauss(0.0, 1e-3))
             tau = rng.uniform(0.0, 900.0)
-            bk = books(
-                rng.uniform(1, 100), rng.uniform(1, 100), rng.uniform(1, 100), rng.uniform(1, 100)
-            )
-            snap = make_snap(snap_ts, spot, ref, tau=tau, bk=bk)
+            snap = make_snap(snap_ts, spot, ref, tau=tau, bk=random_books(rng))
             fv = m.estimate(snap)
-            valid, sigma, z, mom, accel, p = oracle(
-                cfg, obs, snap_ts, spot, ref, tau, fv.book_imbalance
-            )
+            obi = independent_obi(snap)
+            valid, sigma, z, mom, accel, p = oracle(cfg, obs, snap_ts, spot, ref, tau, obi)
             assert fv.valid is valid is True
+            assert fv.book_imbalance == pytest.approx(obi, abs=1e-12)
             assert fv.sigma == pytest.approx(sigma, rel=1e-12)
             assert fv.z == pytest.approx(z, rel=1e-9, abs=1e-12)
             assert fv.momentum == pytest.approx(mom, rel=1e-9, abs=1e-12)

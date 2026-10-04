@@ -183,6 +183,77 @@ def test_books_quotable_matches_book_ok() -> None:
         assert r.book_ok(s, 4) == books_quotable(s, 4)
 
 
+# --------------------------------------------------------------------------- UP / DOWN asymmetry
+#
+# Two books fetched separately need not mirror each other, so every sanity rule must hold for EACH
+# token on its own. The tests above mostly use equal or mirrored widths, where a rule applied to
+# only one of the two books gives the same answer.
+
+TIGHT = (0.49, 0.51)  # 2 ticks
+WIDE = (0.30, 0.50)  # 20 ticks
+
+
+@pytest.mark.parametrize("wide_token", [UP, DOWN])
+def test_book_ok_rejects_a_wide_book_on_either_token_next_to_a_tight_one(
+    wide_token: Outcome,
+) -> None:
+    r = mgr(max_spread_ticks_to_quote=6)
+    s = snap(up=WIDE, down=TIGHT) if wide_token is UP else snap(up=TIGHT, down=WIDE)
+    assert not r.book_ok(s, 6)
+    assert not books_quotable(s, 6)
+    assert r.book_ok(s, 20)  # the same books pass once the limit admits the wide one
+    assert books_quotable(s, 20)
+    assert not r.book_ok(s, 19)
+
+
+@pytest.mark.parametrize("bad_token", [UP, DOWN])
+@pytest.mark.parametrize(
+    "bad",
+    [(None, 0.51), (0.49, None), (0.52, 0.50), (0.50, 0.50), (0.98, 1.2), (-0.2, 0.02)],
+    ids=["no bid", "no ask", "crossed", "locked", "ask above 1", "bid below 0"],
+)
+def test_book_ok_rejects_any_bad_book_on_either_token_next_to_a_good_one(
+    bad_token: Outcome, bad: tuple[float | None, float | None]
+) -> None:
+    r = mgr()
+    s = snap(up=bad, down=TIGHT) if bad_token is UP else snap(up=TIGHT, down=bad)
+    assert not r.book_ok(s, 50)
+    assert not books_quotable(s, 50)
+
+
+def _quotable_by_hand(up: tuple[int, int], down: tuple[int, int], limit: int) -> bool:
+    """DESIGN 2.2(5) / 2.7 from first principles, in integer ticks of 0.01: both books must have a
+    bid and an ask inside [0, 100], the bid strictly below the ask, and ask - bid <= limit."""
+    for bid, ask in (up, down):
+        if not (0 <= bid <= 100 and 0 <= ask <= 100):
+            return False
+        if bid >= ask or ask - bid > limit:
+            return False
+    return True
+
+
+def test_book_ok_and_books_quotable_match_an_independent_rule_on_unmirrored_books() -> None:
+    r = mgr()
+    rng = random.Random(11)
+    seen = {True: 0, False: 0, "wide_one_side": 0}
+    for _ in range(3000):
+        up_bid = rng.randint(1, 98)
+        dn_bid = rng.randint(1, 98)  # independent of the UP book: not its mirror
+        up_ask = up_bid + rng.choice([-1, 0, 1, 1, 2, 3, 6, 7, 12])
+        dn_ask = dn_bid + rng.choice([-1, 0, 1, 1, 2, 3, 6, 7, 12])
+        limit = rng.choice([1, 2, 6, 6, 10])
+        s = snap(up=(up_bid / 100, up_ask / 100), down=(dn_bid / 100, dn_ask / 100))
+        want = _quotable_by_hand((up_bid, up_ask), (dn_bid, dn_ask), limit)
+        assert r.book_ok(s, limit) is want
+        assert books_quotable(s, limit) is want
+        seen[want] += 1
+        up_ok = 0 < up_ask - up_bid <= limit
+        dn_ok = 0 < dn_ask - dn_bid <= limit
+        seen["wide_one_side"] += int(up_ok != dn_ok and up_ask <= 100 and dn_ask <= 100)
+    assert seen[True] > 300 and seen[False] > 300  # both outcomes are well represented
+    assert seen["wide_one_side"] > 300  # the case that mirrored books can never produce
+
+
 # --------------------------------------------------------------------------- capital
 
 
