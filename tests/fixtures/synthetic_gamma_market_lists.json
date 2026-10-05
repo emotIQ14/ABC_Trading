@@ -1,0 +1,12 @@
+{
+  "id": "654321",
+  "question": "SYNTHETIC FIXTURE: Ethereum Up or Down - 15 minute window",
+  "slug": "eth-updown-15m-1704067200",
+  "condition_id": "0xdef456",
+  "outcomes": ["down", "UP"],
+  "clobTokenIds": ["52114319501245915516055106046884209969926127482827954674443846427813813222426", 71321045679252212594626385532706912750332728571942532289631379312455583992563],
+  "startDate": "2024-01-01T01:00:00+01:00",
+  "endDate": null,
+  "orderPriceMinTickSize": "0.001",
+  "orderMinSize": ""
+}
